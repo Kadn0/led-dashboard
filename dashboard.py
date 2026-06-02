@@ -1217,8 +1217,8 @@ def render_iss(iss):
     draw.text((32, 5), "ISS", font=get_font(8), fill=(100, 220, 255), anchor="mm")
     draw.text((32, 13), "OVERHEAD", font=get_font(6), fill=(255, 200, 80), anchor="mm")
 
-    # ── ISS silhouette — compact, centered at (32, 33) ──────────────────
-    cx, cy = 32, 33
+    # ── ISS silhouette — compact, centered at (32, 25) ──────────────────
+    cx, cy = 32, 25
     truss_col  = (170, 175, 180)
     panel_col  = (45, 85, 185)
     cell_col   = (22, 45, 105)
@@ -1248,14 +1248,16 @@ def render_iss(iss):
     draw.rectangle([(cx - 1, cy + 4), (cx + 1, cy + 7)], fill=(220, 225, 230))
 
     # ── Info ─────────────────────────────────────────────────────────────
-    f8 = get_font(8); f7 = get_font(7)
-    y0 = 42  # just below sprite bottom (cy+7=40)
+    f8 = get_font(8); f7 = get_font(7); f6 = get_font(6)
+    y0 = cy + 8  # just below sprite bottom (cy+7)
     if iss and iss.distance is not None:
         dist_str = f"{int(iss.distance):,} mi away"
         bw = draw.textbbox((0, 0), dist_str, font=f8)[2]
         draw.text(((64 - bw) // 2, y0), dist_str, font=f8, fill=(255, 255, 255))
     h8 = draw.textbbox((0, 0), "Ag", font=f8)[3]
-    draw.text((32, y0 + h8 + 2), "17,500 mph", font=f7, fill=(120, 180, 255), anchor="mt")
+    h7 = draw.textbbox((0, 0), "Ag", font=f7)[3]
+    draw.text((32, y0 + h8 + 1), "17,500 mph", font=f7, fill=(120, 180, 255), anchor="mt")
+    draw.text((32, y0 + h8 + h7 + 2), "~250 mi up", font=f6, fill=(100, 140, 220), anchor="mt")
     return img
 
 def render_flight_image(plane, route):
