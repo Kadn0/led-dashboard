@@ -1251,9 +1251,9 @@ def render_iss(iss):
     if iss and iss.distance is not None:
         dist_str = f"{int(iss.distance):,} mi away"
         bbox = draw.textbbox((0, 0), dist_str, font=get_font(8))
-        draw.text(((64 - (bbox[2]-bbox[0])) // 2, 43), dist_str, font=get_font(8), fill=(255, 255, 255))
-    draw.text((32, 51), "17,500 mph", font=get_font(6), fill=(120, 180, 255), anchor="mm")
-    draw.text((32, 58), "~250 mi up", font=get_font(6), fill=(100, 140, 220), anchor="mm")
+        draw.text(((64 - (bbox[2]-bbox[0])) // 2, 42), dist_str, font=get_font(8), fill=(255, 255, 255))
+    draw.text((32, 53), "17,500 mph", font=get_font(6), fill=(120, 180, 255), anchor="mm")
+    draw.text((32, 61), "~250 mi up", font=get_font(6), fill=(100, 140, 220), anchor="mm")
     return img
 
 def render_flight_image(plane, route):
