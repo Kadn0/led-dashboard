@@ -1248,15 +1248,14 @@ def render_iss(iss):
     draw.rectangle([(cx - 1, cy + 4), (cx + 1, cy + 7)], fill=(220, 225, 230))
 
     # ── Info ─────────────────────────────────────────────────────────────
-    f6 = get_font(6)
-    line_h = draw.textbbox((0, 0), "Ag", font=f6)[3] + 1  # measured line height + 1px gap
-    y0 = 41  # first line starts just below sprite (cy+7=40)
+    f8 = get_font(8); f7 = get_font(7)
+    y0 = 42  # just below sprite bottom (cy+7=40)
     if iss and iss.distance is not None:
         dist_str = f"{int(iss.distance):,} mi away"
-        bw = draw.textbbox((0, 0), dist_str, font=f6)[2]
-        draw.text(((64 - bw) // 2, y0), dist_str, font=f6, fill=(255, 255, 255))
-    draw.text((32, y0 + line_h), "17,500 mph", font=f6, fill=(120, 180, 255), anchor="mt")
-    draw.text((32, y0 + line_h * 2), "~250 mi up", font=f6, fill=(100, 140, 220), anchor="mt")
+        bw = draw.textbbox((0, 0), dist_str, font=f8)[2]
+        draw.text(((64 - bw) // 2, y0), dist_str, font=f8, fill=(255, 255, 255))
+    h8 = draw.textbbox((0, 0), "Ag", font=f8)[3]
+    draw.text((32, y0 + h8 + 2), "17,500 mph", font=f7, fill=(120, 180, 255), anchor="mt")
     return img
 
 def render_flight_image(plane, route):
