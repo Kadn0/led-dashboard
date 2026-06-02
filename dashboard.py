@@ -1214,11 +1214,11 @@ def render_iss(iss):
             draw.point((sx, sy), fill=(sb, sb, min(sb + 20, 255)))
 
     # ISS label
-    draw.text((32, 5), "ISS", font=get_font(8), fill=(100, 220, 255), anchor="mm")
-    draw.text((32, 13), "OVERHEAD", font=get_font(6), fill=(255, 200, 80), anchor="mm")
+    draw.text((32, 3), "ISS", font=get_font(8), fill=(100, 220, 255), anchor="mm")
+    draw.text((32, 10), "OVERHEAD", font=get_font(6), fill=(255, 200, 80), anchor="mm")
 
-    # ── ISS silhouette — compact, centered at (32, 25) ──────────────────
-    cx, cy = 32, 25
+    # ── ISS silhouette — compact, centered at (32, 19) ──────────────────
+    cx, cy = 32, 19
     truss_col  = (170, 175, 180)
     panel_col  = (45, 85, 185)
     cell_col   = (22, 45, 105)
