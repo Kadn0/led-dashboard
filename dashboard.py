@@ -1197,74 +1197,63 @@ def render_aqi(aqi_data):
     return img
 
 def render_iss(iss):
-    # Deep-space background — nearly black with a faint blue tint
     img = Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT),(0,0,5))
     draw = ImageDraw.Draw(img)
 
-    # ── Flickering stars ─────────────────────────────────────────────────
-    # tick changes every 0.4s so star brightness animates each frame
+    # Flickering stars — seed changes every 0.4s so they twinkle
     tick = int(time.time() * 2.5)
     rg = random.Random(tick)
-    star_positions = random.Random(99)  # fixed seed keeps star positions stable
+    star_positions = random.Random(99)  # fixed positions, only brightness flickers
     for _ in range(28):
         sx = star_positions.randint(0, 63)
         sy = star_positions.randint(0, 63)
-        # hash position+tick so each star flickers independently
+        # flicker: each star independently on/off based on hash of pos+tick
         flicker_seed = (sx * 97 + sy * 31 + tick) % 7
-        if flicker_seed < 5:  # ~71% chance a star is visible on any given frame
+        if flicker_seed < 5:  # 5/7 chance visible each frame
             sb = rg.randint(120, 255)
-            draw.point((sx, sy), fill=(sb, sb, min(sb + 20, 255)))  # slight blue-white tint
+            draw.point((sx, sy), fill=(sb, sb, min(sb + 20, 255)))
 
-    # ── Header labels ─────────────────────────────────────────────────────
-    draw.text((32, 3), "ISS", font=get_font(8), fill=(100, 220, 255), anchor="mm")
-    draw.text((32, 10), "OVERHEAD", font=get_font(6), fill=(255, 200, 80), anchor="mm")
+    # ISS label
+    draw.text((32, 5), "ISS", font=get_font(8), fill=(100, 220, 255), anchor="mm")
+    draw.text((32, 13), "OVERHEAD", font=get_font(6), fill=(255, 200, 80), anchor="mm")
 
-    # ── ISS silhouette ────────────────────────────────────────────────────
-    # Centered at (32, 19); sprite spans ±16 wide and ±7 tall
-    cx, cy = 32, 19
-    truss_col  = (170, 175, 180)  # light grey aluminium truss
-    panel_col  = (45, 85, 185)    # dark blue solar panel base
-    cell_col   = (22, 45, 105)    # darker blue cell dividers
-    module_col = (200, 205, 210)  # silver habitation module
+    # ── ISS silhouette — compact, centered at (32, 33) ──────────────────
+    cx, cy = 32, 33
+    truss_col  = (170, 175, 180)
+    panel_col  = (45, 85, 185)
+    cell_col   = (22, 45, 105)
+    module_col = (200, 205, 210)
 
-    # Integrated Truss Structure — 32px wide horizontal backbone
+    # Main truss: thin 1-px backbone
     draw.line([(cx - 16, cy), (cx + 16, cy)], fill=truss_col, width=2)
 
-    # Solar arrays — 2 pairs per side (inner ±5, outer ±13 from center)
-    # Each panel is 5px wide × 12px tall with horizontal cell dividers
+    # Solar arrays: 2 pairs per side, each 5 px wide × 10 px tall
+    # Inner pair at ±5 from center, outer at ±13
     for side in (-1, 1):
         for offset in (5, 13):
             px = cx + side * offset
             x0, x1 = px - 2, px + 2
             y0, y1 = cy - 6, cy + 6
             draw.rectangle([(x0, y0), (x1, y1)], fill=panel_col)
-            # Horizontal lines across each panel to represent solar cells
+            # Cell dividers
             for gy in range(y0 + 3, y1, 3):
                 draw.line([(x0, gy), (x1, gy)], fill=cell_col)
 
-    # Central habitation/lab module block
+    # Central habitation module — compact silver box
     draw.rectangle([(cx - 3, cy - 3), (cx + 3, cy + 3)], fill=module_col)
-    draw.line([(cx - 3, cy), (cx + 3, cy)], fill=(150, 155, 160))  # mid seam between modules
+    draw.line([(cx - 3, cy), (cx + 3, cy)], fill=(150, 155, 160))  # equator seam
 
-    # Nadir/zenith radiator panels (above and below the truss centerline)
-    draw.rectangle([(cx - 1, cy - 7), (cx + 1, cy - 4)], fill=(220, 225, 230))  # zenith (up)
-    draw.rectangle([(cx - 1, cy + 4), (cx + 1, cy + 7)], fill=(220, 225, 230))  # nadir (down)
+    # Small nadir/zenith radiators (perpendicular to truss)
+    draw.rectangle([(cx - 1, cy - 7), (cx + 1, cy - 4)], fill=(220, 225, 230))
+    draw.rectangle([(cx - 1, cy + 4), (cx + 1, cy + 7)], fill=(220, 225, 230))
 
-    # ── Info text — stacked below sprite ─────────────────────────────────
-    # Fonts pre-loaded; line heights measured at runtime to avoid overlap
-    f9 = get_font(9); f8 = get_font(8); f7 = get_font(7)
-    y0 = cy + 7  # start just below the bottom of the sprite
+    # ── Info ─────────────────────────────────────────────────────────────
     if iss and iss.distance is not None:
-        # Line 1: current distance to ISS in miles
         dist_str = f"{int(iss.distance):,} mi away"
-        bw = draw.textbbox((0, 0), dist_str, font=f9)[2]  # measure width to center it
-        draw.text(((64 - bw) // 2, y0), dist_str, font=f9, fill=(255, 255, 255))
-    h9 = draw.textbbox((0, 0), "Ag", font=f9)[3]  # actual rendered height of line 1
-    h8 = draw.textbbox((0, 0), "Ag", font=f8)[3]  # actual rendered height of line 2
-    # Line 2: orbital speed (constant, shown for context)
-    draw.text((32, y0 + h9 + 1), "17,500 mph", font=f8, fill=(120, 180, 255), anchor="mt")
-    # Line 3: orbital altitude (constant ~250 mi, shown for context)
-    draw.text((32, y0 + h9 + h8 + 2), "~250 mi up", font=f7, fill=(100, 140, 220), anchor="mt")
+        bbox = draw.textbbox((0, 0), dist_str, font=get_font(8))
+        draw.text(((64 - (bbox[2]-bbox[0])) // 2, 43), dist_str, font=get_font(8), fill=(255, 255, 255))
+    draw.text((32, 51), "17,500 mph", font=get_font(6), fill=(120, 180, 255), anchor="mm")
+    draw.text((32, 58), "~250 mi up", font=get_font(6), fill=(100, 140, 220), anchor="mm")
     return img
 
 def render_flight_image(plane, route):
