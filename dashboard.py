@@ -1648,7 +1648,6 @@ def count_photos():
 # ========== DISPLAY ==========
 _display_proc = None
 _last_raw_img = None
-_display_lock = threading.Lock()  # Prevents concurrent writes to display (avoids flicker)
 
 def get_display_proc():
     global _display_proc
@@ -1658,14 +1657,12 @@ def get_display_proc():
     return _display_proc
 
 def _send_raw(img):
-    """Send image to display driver via PPM pipe. Thread-safe with lock."""
-    with _display_lock:  # Prevent concurrent writes that cause flicker
-        buf = BytesIO(); img.save(buf,"PPM")
-        try:
-            proc = get_display_proc()
-            proc.stdin.write(buf.getvalue()); proc.stdin.flush()
-        except Exception as e:
-            print("Display pipe error: "+str(e))
+    buf = BytesIO(); img.save(buf,"PPM")
+    try:
+        proc = get_display_proc()
+        proc.stdin.write(buf.getvalue()); proc.stdin.flush()
+    except Exception as e:
+        print("Display pipe error: "+str(e))
 
 def display_pil_image(img, photo=False):
     global _last_raw_img
