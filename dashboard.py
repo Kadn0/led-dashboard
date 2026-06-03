@@ -1198,66 +1198,72 @@ def render_aqi(aqi_data):
     return img
 
 def render_iss(iss):
-    img = Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT),(0,0,5))
+    img = Image.new("RGB", (MATRIX_WIDTH, MATRIX_HEIGHT), (0, 0, 8))
     draw = ImageDraw.Draw(img)
 
-    # Flickering stars — seed changes every 0.4s so they twinkle
+    # ── Stars — fixed positions, brightness flickers each frame ──────────
     tick = int(time.time() * 2.5)
     rg = random.Random(tick)
-    star_positions = random.Random(99)  # fixed positions, only brightness flickers
-    for _ in range(28):
-        sx = star_positions.randint(0, 63)
-        sy = star_positions.randint(0, 63)
-        # flicker: each star independently on/off based on hash of pos+tick
-        flicker_seed = (sx * 97 + sy * 31 + tick) % 7
-        if flicker_seed < 5:  # 5/7 chance visible each frame
-            sb = rg.randint(120, 255)
-            draw.point((sx, sy), fill=(sb, sb, min(sb + 20, 255)))
+    star_pos = random.Random(99)
+    for _ in range(30):
+        sx = star_pos.randint(0, 63)
+        sy = star_pos.randint(4, 63)
+        if (sx * 97 + sy * 31 + tick) % 7 < 5:
+            sb = rg.randint(100, 220)
+            draw.point((sx, sy), fill=(sb, sb, min(sb + 25, 255)))
 
-    # ISS label
-    draw.text((32, 5), "ISS", font=get_font(8), fill=(100, 220, 255), anchor="mm")
-    draw.text((32, 13), "OVERHEAD", font=get_font(6), fill=(255, 200, 80), anchor="mm")
+    # ── Earth glow along the bottom edge ─────────────────────────────────
+    for ey in range(57, 64):
+        t = (ey - 57) / 6.0
+        draw.line([(0, ey), (63, ey)], fill=(0, int(t * 28), int(t * 55)))
 
-    # ── ISS silhouette — compact, centered at (32, 33) ──────────────────
-    cx, cy = 32, 33
-    truss_col  = (170, 175, 180)
-    panel_col  = (45, 85, 185)
-    cell_col   = (22, 45, 105)
-    module_col = (200, 205, 210)
+    # ── Header ───────────────────────────────────────────────────────────
+    draw.text((32, 5), "ISS", font=get_font(11), fill=(60, 210, 255), anchor="mm")
+    draw.text((32, 13), "OVERHEAD", font=get_font(6), fill=(255, 185, 50), anchor="mm")
+    # Thin divider line below header
+    draw.line([(8, 17), (55, 17)], fill=(30, 70, 100))
 
-    # Main truss: thin 1-px backbone
-    draw.line([(cx - 16, cy), (cx + 16, cy)], fill=truss_col, width=2)
+    # ── ISS silhouette — centered at (32, 27) ────────────────────────────
+    cx, cy = 32, 27
+    truss_col  = (160, 168, 175)  # aluminium grey truss
+    panel_col  = (30, 80, 200)    # vivid blue solar panel
+    cell_col   = (15, 40, 110)    # darker cell divider lines
+    module_col = (210, 215, 220)  # silver module body
+    radiator_col = (200, 220, 230)
 
-    # Solar arrays: 2 pairs per side, each 5 px wide × 10 px tall
-    # Inner pair at ±5 from center, outer at ±13
+    # Main horizontal truss backbone
+    draw.line([(cx - 18, cy), (cx + 18, cy)], fill=truss_col, width=2)
+
+    # Solar arrays — 2 pairs per side, inner ±6, outer ±14
     for side in (-1, 1):
-        for offset in (5, 13):
+        for offset in (6, 14):
             px = cx + side * offset
             x0, x1 = px - 2, px + 2
-            y0, y1 = cy - 6, cy + 6
-            draw.rectangle([(x0, y0), (x1, y1)], fill=panel_col)
-            # Cell dividers
-            for gy in range(y0 + 3, y1, 3):
+            py0, py1 = cy - 7, cy + 7
+            draw.rectangle([(x0, py0), (x1, py1)], fill=panel_col)
+            for gy in range(py0 + 3, py1, 3):
                 draw.line([(x0, gy), (x1, gy)], fill=cell_col)
 
-    # Central habitation module — compact silver box
-    draw.rectangle([(cx - 3, cy - 3), (cx + 3, cy + 3)], fill=module_col)
-    draw.line([(cx - 3, cy), (cx + 3, cy)], fill=(150, 155, 160))  # equator seam
+    # Central habitation module
+    draw.rectangle([(cx - 4, cy - 3), (cx + 4, cy + 3)], fill=module_col)
+    draw.line([(cx - 4, cy), (cx + 4, cy)], fill=(145, 150, 158))  # module seam
+    draw.rectangle([(cx - 1, cy - 1), (cx + 1, cy + 1)], fill=(180, 185, 195))  # cupola
 
-    # Small nadir/zenith radiators (perpendicular to truss)
-    draw.rectangle([(cx - 1, cy - 7), (cx + 1, cy - 4)], fill=(220, 225, 230))
-    draw.rectangle([(cx - 1, cy + 4), (cx + 1, cy + 7)], fill=(220, 225, 230))
+    # Nadir/zenith radiators
+    draw.rectangle([(cx - 1, cy - 9), (cx + 1, cy - 5)], fill=radiator_col)
+    draw.rectangle([(cx - 1, cy + 5), (cx + 1, cy + 9)], fill=radiator_col)
 
-    # ── Info ─────────────────────────────────────────────────────────────
-    f6 = get_font(6)
-    line_h = draw.textbbox((0, 0), "Ag", font=f6)[3] + 1  # measured line height + 1px gap
-    y0 = 41  # first line starts just below sprite (cy+7=40)
+    # ── Info text ─────────────────────────────────────────────────────────
+    f9 = get_font(9); f8 = get_font(8)
+    y0 = cy + 11  # start just below the sprite
+    h9 = draw.textbbox((0, 0), "Ag", font=f9)[3]
+
     if iss and iss.distance is not None:
         dist_str = f"{int(iss.distance):,} mi away"
-        bw = draw.textbbox((0, 0), dist_str, font=f6)[2]
-        draw.text(((64 - bw) // 2, y0), dist_str, font=f6, fill=(255, 255, 255))
-    draw.text((32, y0 + line_h), "17,500 mph", font=f6, fill=(120, 180, 255), anchor="mt")
-    draw.text((32, y0 + line_h * 2), "~250 mi up", font=f6, fill=(100, 140, 220), anchor="mt")
+        bw = draw.textbbox((0, 0), dist_str, font=f9)[2]
+        draw.text(((64 - bw) // 2, y0), dist_str, font=f9, fill=(255, 255, 255))
+
+    draw.text((32, y0 + h9 + 2), "17,500 mph", font=f8, fill=(100, 170, 255), anchor="mt")
     return img
 
 def render_flight_image(plane, route):
