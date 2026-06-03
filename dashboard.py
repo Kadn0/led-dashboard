@@ -1918,6 +1918,7 @@ def main():
         bd.rectangle([(0, MATRIX_HEIGHT - 3), (MATRIX_WIDTH - 1, MATRIX_HEIGHT - 1)], fill=(0, 80, 160))
         display_pil_image(boot)
         time.sleep(2.0)
+        do_plane_transition(Image.new("RGB", (MATRIX_WIDTH, MATRIX_HEIGHT), (0, 0, 0)))
 
         while True:
             now = time.time()
