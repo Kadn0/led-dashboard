@@ -1586,6 +1586,7 @@ def count_photos():
 # ========== DISPLAY ==========
 _display_proc = None
 _last_raw_img = None
+_display_lock = threading.Lock()  # Prevents concurrent writes to display (avoids flicker)
 
 def get_display_proc():
     global _display_proc
@@ -1595,12 +1596,14 @@ def get_display_proc():
     return _display_proc
 
 def _send_raw(img):
-    buf = BytesIO(); img.save(buf,"PPM")
-    try:
-        proc = get_display_proc()
-        proc.stdin.write(buf.getvalue()); proc.stdin.flush()
-    except Exception as e:
-        print("Display pipe error: "+str(e))
+    """Send image to display driver via PPM pipe. Thread-safe with lock."""
+    with _display_lock:  # Prevent concurrent writes that cause flicker
+        buf = BytesIO(); img.save(buf,"PPM")
+        try:
+            proc = get_display_proc()
+            proc.stdin.write(buf.getvalue()); proc.stdin.flush()
+        except Exception as e:
+            print("Display pipe error: "+str(e))
 
 def display_pil_image(img, photo=False):
     global _last_raw_img
@@ -1786,10 +1789,22 @@ def main():
     else:
         print(f"Location: using config ({CHATTANOOGA_LAT:.4f}, {CHATTANOOGA_LON:.4f})")
 
-    # ── HomePod / Apple TV: auto-discover via mDNS, no static IDs needed ──
-    homepod = HomePodManager() if HAS_PYATV else None
+    # ── HomePod / Apple TV: auto-discover via mDNS ──
+    # mDNS scanning allows us to find any HomePod/AppleTV on the local network without hardcoded IPs.
+    # This requires: (1) pyatv library installed, (2) mDNS working on the network (port 5353 open)
+    # If mDNS fails, music detection from HomePod won't work but the rest of the dashboard continues.
+    homepod = None
+    homepod_status = "disabled"
     if HAS_PYATV:
-        print("HomePod/AppleTV auto-discovery started (scanning network…)")
+        try:
+            homepod = HomePodManager()
+            print("HomePod/AppleTV auto-discovery started (mDNS scan in progress…)")
+            homepod_status = "initializing"
+        except Exception as e:
+            print(f"HomePod init failed (mDNS may be blocked on this network): {e}")
+            homepod_status = "init_failed"
+    else:
+        print("pyatv not installed — HomePod detection disabled")
     flights = FlightTracker()
     weather = WeatherClient()
     aqi_client = AirQualityClient()
