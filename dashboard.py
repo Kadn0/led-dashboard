@@ -1627,45 +1627,41 @@ def do_transition():
     time.sleep(0.04)
 
 def do_plane_transition(flight_img):
-    """Side-view plane (left→right) fills screen, wings barn-door wipe to reveal next slide."""
+    """Plane flies left→right; nose leads at center, wings span top-to-bottom.
+    New slide is revealed seamlessly behind the plane as it crosses."""
     b = get_brightness()
     W, H = MATRIX_WIDTH, MATRIX_HEIGHT
-    mid = H // 2  # 32 — fuselage/wing centerline, used as wipe split
-    col = (225, 230, 240)  # single color for the whole plane
+    mid = H // 2  # 32
+    col = (225, 230, 240)
 
-    plane_img = Image.new("RGB", (W, H), (0, 0, 0))
-    d = ImageDraw.Draw(plane_img)
+    # Distance from nose tip to the wing trailing edge
+    trail = 24
 
-    # Fuselage — horizontal tube pointing right
-    d.rectangle([(10, mid - 2), (57, mid + 2)], fill=col)
-    # Nose taper
-    d.rectangle([(58, mid - 1), (60, mid + 1)], fill=col)
-    d.point((61, mid), fill=col)
-    # Cockpit canopy bump above fuselage
-    d.polygon([(44, mid - 2), (47, mid - 7), (54, mid - 7), (56, mid - 2)], fill=col)
+    frames = 36
+    for frame in range(frames):
+        t = frame / (frames - 1)
+        nose_x = int(t * (W + trail)) - trail  # sweeps -24 → 64
 
-    # Main wings — large swept shape spanning most of the vertical height
-    d.polygon([(20, mid - 2), (34, 8),  (37, mid - 2)], fill=col)  # upper wing
-    d.polygon([(20, mid + 2), (34, 56), (37, mid + 2)], fill=col)  # lower wing
+        img = flight_img.copy()
+        draw = ImageDraw.Draw(img)
 
-    # Horizontal tail stabilizers
-    d.polygon([(10, mid - 2), (19, mid - 9), (21, mid - 2)], fill=col)  # upper stab
-    d.polygon([(10, mid + 2), (19, mid + 9), (21, mid + 2)], fill=col)  # lower stab
+        # Black out everything the plane hasn't reached yet (right of nose)
+        if nose_x + 1 < W:
+            draw.rectangle([(nose_x + 1, 0), (W - 1, H - 1)], fill=(0, 0, 0))
 
-    # Hold briefly so the shape registers
-    for _ in range(10):
-        _send_raw(ImageEnhance.Brightness(plane_img).enhance(b))
-        time.sleep(0.04)
+        # Plane silhouette — arrowhead pointing right
+        # Nose at screen center-height; wings trailing back to top & bottom edges
+        back_x = nose_x - trail
+        plane_pts = [
+            (nose_x,     mid),      # nose tip
+            (back_x,     0),        # upper wingtip (left wing → top of screen)
+            (back_x - 4, mid),      # tail concave indent
+            (back_x,     H - 1),    # lower wingtip (right wing → bottom of screen)
+        ]
+        draw.polygon(plane_pts, fill=col)
 
-    # Barn-door wipe: top half slides up, bottom half slides down from fuselage centerline
-    steps = 24
-    for step in range(steps + 1):
-        offset = int((step / steps) * (H // 2 + 10))
-        frame = flight_img.copy()
-        frame.paste(plane_img.crop((0, 0, W, mid)), (0, -offset))
-        frame.paste(plane_img.crop((0, mid, W, H)), (0, mid + offset))
-        _send_raw(ImageEnhance.Brightness(frame).enhance(b))
-        time.sleep(0.028)
+        _send_raw(ImageEnhance.Brightness(img).enhance(b))
+        time.sleep(0.035)
 
 
 _file_cache_path = None
