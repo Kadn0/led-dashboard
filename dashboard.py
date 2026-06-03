@@ -384,7 +384,12 @@ def get_airline_logo(icao, iata=None):
 # ========== MUSIC CLIENTS ==========
 
 # pyatv device model names that can play media (HomePods + Apple TVs)
-_HOMEPOD_MODELS = {"HomePod", "HomePodMini", "HomePodGen2"}
+_HOMEPOD_MODELS = {
+    "HomePod", "HomePodMini", "HomePodGen2",
+    "HomePodMiniGen1", "HomePod2ndGen",
+    "AudioAccessory1,1", "AudioAccessory1,2",
+    "AudioAccessory5,1", "AudioAccessory6,1",
+}
 _ATV_MODELS     = {"Gen2", "Gen3", "Gen4", "Gen4K",
                    "AppleTV4KGen2", "AppleTV4KGen3", "AppleTVGen1"}
 _MEDIA_DEVICE_MODELS = _HOMEPOD_MODELS | _ATV_MODELS | {"Music"}
@@ -412,11 +417,9 @@ class HomePodManager:
     async def _scan(self):
         """Broadcast mDNS scan — discovers all Apple media devices, no IDs needed."""
         try:
-            found = await asyncio.wait_for(pyatv.scan(self._loop), timeout=12)
+            found = await asyncio.wait_for(pyatv.scan(self._loop), timeout=15)
             for device in found:
                 ident = device.identifier
-                if ident in self._cfgs:
-                    continue
                 # Determine model name
                 model_name = ""
                 try:
@@ -424,13 +427,17 @@ class HomePodManager:
                         model_name = device.device_info.model.name
                 except Exception:
                     pass
+                # Log every device found so model mismatches are visible in console
+                print(f"pyatv found: {device.name!r} model={model_name!r} [{ident}]")
+                if ident in self._cfgs:
+                    continue
                 if model_name not in _MEDIA_DEVICE_MODELS:
                     continue
                 self._cfgs[ident] = device
                 dtype = "appletv" if model_name in _ATV_MODELS else "homepod"
                 print(f"Discovered {dtype}: {device.name} ({model_name}) [{ident}]")
         except Exception as e:
-            print(f"HomePod scan: {e}")
+            print(f"HomePod scan error: {e}")
         self._last_scan = time.time()
 
     def _dtype_for(self, ident):
@@ -1679,9 +1686,9 @@ def do_plane_transition(flight_img):
         ], fill=col)
 
         # ── Engine nacelles (2 per wing, rectangular pods) ───────────────
-        for ey, ew in [(-10, -7), (-21, -18)]:   # upper wing engines
+        for ey, ew in [(-10, -7), (-21, -18)]:   # upper wing (ey < ew → y0 < y1 ✓)
             d.rectangle([pt(nx, -13, ey), pt(nx, -10, ew)], fill=col)
-        for ey, ew in [(10, 7), (21, 18)]:        # lower wing engines
+        for ey, ew in [(7, 10), (18, 21)]:        # lower wing (ey < ew → y0 < y1 ✓)
             d.rectangle([pt(nx, -13, ey), pt(nx, -10, ew)], fill=col)
 
         # ── Horizontal tail stabilizers ───────────────────────────────────
@@ -1925,11 +1932,7 @@ def main():
     print("Brightness: 6-20=100%, 20-23=35%, 23-6=off")
 
     try:
-        cached_weather = weather.fetch()
-        cached_aqi = aqi_client.fetch()
-        weather_fetch_time = time.time()
-
-        # Boot splash with animated progress bar
+        # Boot splash — show immediately before any blocking API calls
         cx, cy = MATRIX_WIDTH // 2, MATRIX_HEIGHT // 2
         boot = Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT), (0, 0, 0))
         bd = ImageDraw.Draw(boot)
@@ -1938,19 +1941,48 @@ def main():
         bd.text((cx, cy +  9), DASHBOARD_VERSION, font=get_font(6), fill=(30, 50, 80), anchor="mm")
         bd.text((cx, cy + 22), DASHBOARD_CREDIT,  font=get_font(6), fill=DASHBOARD_CREDIT_COLOR, anchor="mm")
 
-        # Animate the bottom bar as a progress bar over 2 seconds
-        bar_steps = 40
-        for i in range(bar_steps + 1):
+        def _draw_boot_progress(fraction):
             frame = boot.copy()
             fd = ImageDraw.Draw(frame)
-            fill_w = int((i / bar_steps) * MATRIX_WIDTH)
-            # Track (dim background)
-            fd.rectangle([(0, MATRIX_HEIGHT - 3), (MATRIX_WIDTH - 1, MATRIX_HEIGHT - 1)], fill=(0, 25, 60))
-            # Fill (bright progress)
+            fill_w = int(fraction * MATRIX_WIDTH)
+            fd.rectangle([(0, MATRIX_HEIGHT-3),(MATRIX_WIDTH-1, MATRIX_HEIGHT-1)], fill=(0,25,60))
             if fill_w > 0:
-                fd.rectangle([(0, MATRIX_HEIGHT - 3), (fill_w - 1, MATRIX_HEIGHT - 1)], fill=(0, 120, 255))
+                fd.rectangle([(0, MATRIX_HEIGHT-3),(fill_w-1, MATRIX_HEIGHT-1)], fill=(0,120,255))
             display_pil_image(frame)
-            time.sleep(2.0 / bar_steps)
+
+        _draw_boot_progress(0.0)
+
+        # Fetch weather + AQI in background so the progress bar reflects real load time
+        weather_box = [None]; aqi_box = [None]; done_flags = [False, False]
+        def _fetch_weather():
+            try: weather_box[0] = weather.fetch()
+            except: pass
+            done_flags[0] = True
+        def _fetch_aqi():
+            try: aqi_box[0] = aqi_client.fetch()
+            except: pass
+            done_flags[1] = True
+        threading.Thread(target=_fetch_weather, daemon=True).start()
+        threading.Thread(target=_fetch_aqi,     daemon=True).start()
+
+        # Animate bar — stays incomplete until both fetches finish (max 12s)
+        max_wait = 12.0
+        start_t  = time.time()
+        while not all(done_flags):
+            elapsed  = time.time() - start_t
+            api_done = sum(done_flags)
+            t_frac   = min(elapsed / max_wait, 1.0)
+            # Weight: each completed API = 45%, time-based drift = 10% (so bar never reaches 100% until done)
+            progress = min(api_done * 0.45 + t_frac * 0.10, 0.99)
+            _draw_boot_progress(progress)
+            time.sleep(0.05)
+
+        _draw_boot_progress(1.0)
+        time.sleep(0.2)
+
+        cached_weather    = weather_box[0]
+        cached_aqi        = aqi_box[0]
+        weather_fetch_time = time.time()
 
         try:
             first_slide = render_clock()
