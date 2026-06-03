@@ -1655,11 +1655,10 @@ def do_plane_transition(flight_img):
         # Nose sweeps from fully off-screen-left to fully off-screen-right
         nose_x = int(t * (W + plane_len)) - plane_len
 
-        # Old slide fills the whole frame; new slide revealed left of the plane's tail
+        # Old slide on right, new slide revealed left of the nose — plane rides the boundary
         img = from_img.copy()
-        tail_x = nose_x - plane_len
-        if tail_x > 0:
-            img.paste(flight_img.crop((0, 0, min(tail_x, W), H)), (0, 0))
+        if nose_x > 0:
+            img.paste(flight_img.crop((0, 0, min(nose_x, W), H)), (0, 0))
 
         d = ImageDraw.Draw(img)
         nx = nose_x  # shorthand
