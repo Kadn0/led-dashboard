@@ -1649,10 +1649,10 @@ def do_plane_transition(flight_img):
         """Screen coordinate relative to nose position."""
         return (nose_x + dx, mid + dy)
 
-    frames = 52
+    frames = 70  # extended so plane fully exits screen
     for frame in range(frames):
         t = frame / (frames - 1)
-        nose_x = int(t * (W + plane_len)) - plane_len
+        nose_x = int(t * (W + plane_len + 15)) - plane_len  # extra 15px to clear completely
 
         # Wing leading edge: root at (nx-10, mid), tips at (nx-26, 0) and (nx-26, H-1)
         # Use this chevron as the wipe mask — new slide left, old slide right, plane on top
