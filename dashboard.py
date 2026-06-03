@@ -1627,55 +1627,43 @@ def do_transition():
     time.sleep(0.04)
 
 def do_plane_transition(flight_img):
-    """Full-screen top-down plane; wings split apart to reveal the flight info slide."""
+    """Side-view plane (left→right) fills screen, wings barn-door wipe to reveal next slide."""
     b = get_brightness()
     W, H = MATRIX_WIDTH, MATRIX_HEIGHT
-    cx = W // 2  # 32
+    mid = H // 2  # 32 — fuselage/wing centerline, used as wipe split
+    col = (225, 230, 240)  # single color for the whole plane
 
     plane_img = Image.new("RGB", (W, H), (0, 0, 0))
     d = ImageDraw.Draw(plane_img)
 
-    body  = (210, 215, 220)   # silver fuselage
-    wing  = (155, 165, 178)   # slightly darker wing surfaces
-    glass = (70, 155, 255)    # cockpit blue
-
-    # Fuselage — runs nearly full height, 4px wide
-    d.rectangle([(cx-2, 5), (cx+2, 59)], fill=body)
+    # Fuselage — horizontal tube pointing right
+    d.rectangle([(10, mid - 2), (57, mid + 2)], fill=col)
     # Nose taper
-    d.rectangle([(cx-1, 3), (cx+1, 5)], fill=body)
-    d.point((cx, 2), fill=body)
-    # Cockpit windows
-    d.rectangle([(cx-1, 9), (cx+1, 14)], fill=glass)
+    d.rectangle([(58, mid - 1), (60, mid + 1)], fill=col)
+    d.point((61, mid), fill=col)
+    # Cockpit canopy bump above fuselage
+    d.polygon([(44, mid - 2), (47, mid - 7), (54, mid - 7), (56, mid - 2)], fill=col)
 
-    # Main wings — swept, span full 64px width at center (y=28)
-    wing_y = 28
-    for dy in range(-9, 10):
-        y = wing_y + dy
-        spread = int((1.0 - abs(dy) / 9.0 * 0.82) * 31)
-        d.line([(cx - spread, y), (cx + spread, y)], fill=wing)
+    # Main wings — large swept shape spanning most of the vertical height
+    d.polygon([(20, mid - 2), (34, 8),  (37, mid - 2)], fill=col)  # upper wing
+    d.polygon([(20, mid + 2), (34, 56), (37, mid + 2)], fill=col)  # lower wing
 
-    # Tail fins
-    for dy in range(-5, 6):
-        y = 47 + dy
-        spread = int((1.0 - abs(dy) / 5.0 * 0.65) * 14)
-        d.line([(cx - spread, y), (cx + spread, y)], fill=wing)
+    # Horizontal tail stabilizers
+    d.polygon([(10, mid - 2), (19, mid - 9), (21, mid - 2)], fill=col)  # upper stab
+    d.polygon([(10, mid + 2), (19, mid + 9), (21, mid + 2)], fill=col)  # lower stab
 
-    # Phase 1: hold the plane on screen briefly
+    # Hold briefly so the shape registers
     for _ in range(10):
         _send_raw(ImageEnhance.Brightness(plane_img).enhance(b))
         time.sleep(0.04)
 
-    # Phase 2: barn-door wipe — top half slides up, bottom half slides down
-    # revealing the flight_img underneath, splitting at the wing centerline
-    split = wing_y
+    # Barn-door wipe: top half slides up, bottom half slides down from fuselage centerline
     steps = 24
     for step in range(steps + 1):
         offset = int((step / steps) * (H // 2 + 10))
         frame = flight_img.copy()
-        # Top portion of plane shifts up by offset
-        frame.paste(plane_img.crop((0, 0, W, split)), (0, -offset))
-        # Bottom portion of plane shifts down by offset
-        frame.paste(plane_img.crop((0, split, W, H)), (0, split + offset))
+        frame.paste(plane_img.crop((0, 0, W, mid)), (0, -offset))
+        frame.paste(plane_img.crop((0, mid, W, H)), (0, mid + offset))
         _send_raw(ImageEnhance.Brightness(frame).enhance(b))
         time.sleep(0.028)
 
