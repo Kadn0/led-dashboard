@@ -1624,14 +1624,15 @@ def display_pil_image(img, photo=False):
     _send_raw(apply_dimming(img))
 
 def do_transition():
+    """Quick 2-frame fade to black between slides."""
     global _last_raw_img
     if _last_raw_img is None: return
     b = get_brightness()
-    steps = [0.55, 0.32, 0.16, 0.06, 0.0]
-    for f in steps:
-        _send_raw(ImageEnhance.Brightness(_last_raw_img).enhance(b * f) if f > 0 else Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT),(0,0,0)))
-        time.sleep(0.04)
-    time.sleep(0.04)
+    # Fast fade: 50% brightness, then black
+    _send_raw(ImageEnhance.Brightness(_last_raw_img).enhance(b * 0.5))
+    time.sleep(0.02)
+    _send_raw(Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT),(0,0,0)))
+    time.sleep(0.02)
 
 def do_plane_transition(flight_img):
     """Top-down airliner silhouette sweeps left→right; new slide revealed behind it."""
@@ -1649,10 +1650,11 @@ def do_plane_transition(flight_img):
         """Screen coordinate relative to nose position."""
         return (nose_x + dx, mid + dy)
 
-    frames = 70  # extended so plane fully exits screen
+    frames = 80
     for frame in range(frames):
         t = frame / (frames - 1)
-        nose_x = int(t * (W + plane_len + 15)) - plane_len  # extra 15px to clear completely
+        # Nose to tail = 46px. For tail to clear screen (>= 64), nose must reach >= 110
+        nose_x = int(t * (W + plane_len + 46)) - plane_len
 
         # Wing leading edge: root at (nx-10, mid), tips at (nx-26, 0) and (nx-26, H-1)
         # Use this chevron as the wipe mask — new slide left, old slide right, plane on top
