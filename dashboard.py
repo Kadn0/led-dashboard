@@ -1626,43 +1626,58 @@ def do_transition():
         time.sleep(0.04)
     time.sleep(0.04)
 
-def do_plane_transition():
-    """Animate a plane flying left-to-right across a dark screen before showing flight info."""
+def do_plane_transition(flight_img):
+    """Full-screen top-down plane; wings split apart to reveal the flight info slide."""
     b = get_brightness()
-    # Side-view plane shape pointing right (9 wide x 5 tall), relative coords
-    shape = [
-        (4, 0),
-        (1,1),(2,1),(3,1),(4,1),(5,1),(6,1),(7,1),
-        (0,2),(1,2),(2,2),(3,2),(4,2),(5,2),(6,2),(7,2),(8,2),
-        (3,3),(4,3),(5,3),
-        (4,4),
-    ]
-    plane_col = (220, 230, 255)
-    trail_cols = [(20, 30, 60), (35, 50, 100), (55, 75, 140)]  # fading contrail dots
+    W, H = MATRIX_WIDTH, MATRIX_HEIGHT
+    cx = W // 2  # 32
 
-    frames = 28
-    for frame in range(frames):
-        img = Image.new("RGB", (MATRIX_WIDTH, MATRIX_HEIGHT), (0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        # Plane moves from off-screen left to off-screen right
-        nose_x = int((frame / (frames - 1)) * (MATRIX_WIDTH + 16)) - 12
-        py = (MATRIX_HEIGHT - 5) // 2  # vertically centered
+    plane_img = Image.new("RGB", (W, H), (0, 0, 0))
+    d = ImageDraw.Draw(plane_img)
 
-        # Contrail — 3 fading dots trailing behind the plane
-        for i, col in enumerate(trail_cols):
-            tx = nose_x - 2 - i * 4
-            ty = py + 2
-            if 0 <= tx < MATRIX_WIDTH:
-                draw.point((tx, ty), fill=col)
+    body  = (210, 215, 220)   # silver fuselage
+    wing  = (155, 165, 178)   # slightly darker wing surfaces
+    glass = (70, 155, 255)    # cockpit blue
 
-        # Plane body
-        for dx, dy in shape:
-            x, y = nose_x + dx, py + dy
-            if 0 <= x < MATRIX_WIDTH and 0 <= y < MATRIX_HEIGHT:
-                draw.point((x, y), fill=plane_col)
+    # Fuselage — runs nearly full height, 4px wide
+    d.rectangle([(cx-2, 5), (cx+2, 59)], fill=body)
+    # Nose taper
+    d.rectangle([(cx-1, 3), (cx+1, 5)], fill=body)
+    d.point((cx, 2), fill=body)
+    # Cockpit windows
+    d.rectangle([(cx-1, 9), (cx+1, 14)], fill=glass)
 
-        _send_raw(ImageEnhance.Brightness(img).enhance(b))
-        time.sleep(0.035)
+    # Main wings — swept, span full 64px width at center (y=28)
+    wing_y = 28
+    for dy in range(-9, 10):
+        y = wing_y + dy
+        spread = int((1.0 - abs(dy) / 9.0 * 0.82) * 31)
+        d.line([(cx - spread, y), (cx + spread, y)], fill=wing)
+
+    # Tail fins
+    for dy in range(-5, 6):
+        y = 47 + dy
+        spread = int((1.0 - abs(dy) / 5.0 * 0.65) * 14)
+        d.line([(cx - spread, y), (cx + spread, y)], fill=wing)
+
+    # Phase 1: hold the plane on screen briefly
+    for _ in range(10):
+        _send_raw(ImageEnhance.Brightness(plane_img).enhance(b))
+        time.sleep(0.04)
+
+    # Phase 2: barn-door wipe — top half slides up, bottom half slides down
+    # revealing the flight_img underneath, splitting at the wing centerline
+    split = wing_y
+    steps = 24
+    for step in range(steps + 1):
+        offset = int((step / steps) * (H // 2 + 10))
+        frame = flight_img.copy()
+        # Top portion of plane shifts up by offset
+        frame.paste(plane_img.crop((0, 0, W, split)), (0, -offset))
+        # Bottom portion of plane shifts down by offset
+        frame.paste(plane_img.crop((0, split, W, H)), (0, split + offset))
+        _send_raw(ImageEnhance.Brightness(frame).enhance(b))
+        time.sleep(0.028)
 
 
 _file_cache_path = None
@@ -2167,7 +2182,7 @@ def main():
                     current_plane_show_start = now
                     # plane_last_shown set AFTER display completes, not on detection
                     print("PLANE: "+cs+" "+str(round(p["distance"],1))+"mi "+str(p["altitude_ft"])+"ft")
-                    do_plane_transition()
+                    do_plane_transition(render_flight_image(p, route))
                     if route.get("origin") and route.get("dest"):
                         print("  "+route["origin"]+" -> "+route["dest"])
                 if now - current_plane_show_start < PLANE_DISPLAY_DURATION:
