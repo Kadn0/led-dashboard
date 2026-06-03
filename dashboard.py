@@ -1627,41 +1627,77 @@ def do_transition():
     time.sleep(0.04)
 
 def do_plane_transition(flight_img):
-    """Plane flies left→right; nose leads at center, wings span top-to-bottom.
-    New slide is revealed seamlessly behind the plane as it crosses."""
+    """Plane silhouette sweeps left→right over the new slide.
+    New slide pixels are visible everywhere the plane has already passed."""
     b = get_brightness()
     W, H = MATRIX_WIDTH, MATRIX_HEIGHT
     mid = H // 2  # 32
-    col = (225, 230, 240)
+    col = (230, 235, 245)
 
-    # Distance from nose tip to the wing trailing edge
-    trail = 24
+    # Plane geometry (all x relative to nose_x):
+    #   nose tip        → nose_x, mid
+    #   wing leading    → nose_x - 8,  mid ± 1   (where wings meet fuselage)
+    #   upper wingtip   → nose_x - 14, 0          (left wing touches top)
+    #   lower wingtip   → nose_x - 14, H-1        (right wing touches bottom)
+    #   tail            → nose_x - 26, mid ± 1
+    #   tail fin up     → nose_x - 22, mid - 9
+    #   tail fin down   → nose_x - 22, mid + 9
+    #   tail tip        → nose_x - 30, mid
 
-    frames = 36
+    wing_w   = 14   # how far back wings are from nose
+    tail_x   = 30   # how far back the tail tip is
+    plane_w  = tail_x + 2  # total plane width used to offset start
+
+    frames = 40
     for frame in range(frames):
         t = frame / (frames - 1)
-        nose_x = int(t * (W + trail)) - trail  # sweeps -24 → 64
+        # nose sweeps from just off-screen-left to just off-screen-right
+        nose_x = int(t * (W + plane_w)) - plane_w
 
-        img = flight_img.copy()
+        # Base layer: new slide already revealed everywhere the plane's tail has passed
+        revealed_x = nose_x - plane_w
+        img = Image.new("RGB", (W, H), (0, 0, 0))
+        if revealed_x > 0:
+            img.paste(flight_img.crop((0, 0, min(revealed_x, W), H)), (0, 0))
+
         draw = ImageDraw.Draw(img)
 
-        # Black out everything the plane hasn't reached yet (right of nose)
-        if nose_x + 1 < W:
-            draw.rectangle([(nose_x + 1, 0), (W - 1, H - 1)], fill=(0, 0, 0))
+        # ── Fuselage ──────────────────────────────────────────────────
+        draw.polygon([
+            (nose_x,        mid),
+            (nose_x - 2,    mid - 1),
+            (nose_x - tail_x - 2, mid - 1),
+            (nose_x - tail_x,     mid),
+            (nose_x - tail_x - 2, mid + 1),
+            (nose_x - 2,    mid + 1),
+        ], fill=col)
 
-        # Plane silhouette — arrowhead pointing right
-        # Nose at screen center-height; wings trailing back to top & bottom edges
-        back_x = nose_x - trail
-        plane_pts = [
-            (nose_x,     mid),      # nose tip
-            (back_x,     0),        # upper wingtip (left wing → top of screen)
-            (back_x - 4, mid),      # tail concave indent
-            (back_x,     H - 1),    # lower wingtip (right wing → bottom of screen)
-        ]
-        draw.polygon(plane_pts, fill=col)
+        # ── Main wings (large swept delta, top and bottom) ────────────
+        draw.polygon([
+            (nose_x - 6,    mid - 1),
+            (nose_x - wing_w, 0),
+            (nose_x - wing_w - 6, mid - 1),
+        ], fill=col)
+        draw.polygon([
+            (nose_x - 6,    mid + 1),
+            (nose_x - wing_w, H - 1),
+            (nose_x - wing_w - 6, mid + 1),
+        ], fill=col)
+
+        # ── Tail fins (smaller, at the rear) ──────────────────────────
+        draw.polygon([
+            (nose_x - 20, mid - 1),
+            (nose_x - 22, mid - 9),
+            (nose_x - 27, mid - 1),
+        ], fill=col)
+        draw.polygon([
+            (nose_x - 20, mid + 1),
+            (nose_x - 22, mid + 9),
+            (nose_x - 27, mid + 1),
+        ], fill=col)
 
         _send_raw(ImageEnhance.Brightness(img).enhance(b))
-        time.sleep(0.035)
+        time.sleep(0.032)
 
 
 _file_cache_path = None
