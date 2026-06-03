@@ -1642,18 +1642,21 @@ def do_plane_transition(flight_img):
 
     plane_len = 46   # nose to tail in pixels
 
+    # Capture whatever is currently on screen as the outgoing slide
+    from_img = _last_raw_img.copy() if _last_raw_img else Image.new("RGB", (W, H), (0, 0, 0))
+
     def pt(nose_x, dx, dy):
         """Screen coordinate relative to nose position."""
         return (nose_x + dx, mid + dy)
 
-    frames = 46
+    frames = 52
     for frame in range(frames):
         t = frame / (frames - 1)
         # Nose sweeps from fully off-screen-left to fully off-screen-right
         nose_x = int(t * (W + plane_len)) - plane_len
 
-        # Paste already-revealed portion of new slide (left of plane's tail)
-        img = Image.new("RGB", (W, H), (0, 0, 0))
+        # Old slide fills the whole frame; new slide revealed left of the plane's tail
+        img = from_img.copy()
         tail_x = nose_x - plane_len
         if tail_x > 0:
             img.paste(flight_img.crop((0, 0, min(tail_x, W), H)), (0, 0))
