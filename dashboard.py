@@ -1624,15 +1624,17 @@ def display_pil_image(img, photo=False):
     _send_raw(apply_dimming(img))
 
 def do_transition():
-    """Quick 2-frame fade to black between slides."""
+    """Crossfade: old slide fades to transparent, new black fades to opaque."""
     global _last_raw_img
     if _last_raw_img is None: return
     b = get_brightness()
-    # Fast fade: 50% brightness, then black
-    _send_raw(ImageEnhance.Brightness(_last_raw_img).enhance(b * 0.5))
-    time.sleep(0.02)
-    _send_raw(Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT),(0,0,0)))
-    time.sleep(0.02)
+    black = Image.new("RGB", (MATRIX_WIDTH, MATRIX_HEIGHT), (0, 0, 0))
+    # Smooth 6-frame crossfade
+    for i in range(7):
+        blend = i / 6.0  # 0→1
+        img = Image.blend(_last_raw_img, black, blend)
+        _send_raw(ImageEnhance.Brightness(img).enhance(b))
+        time.sleep(0.025)
 
 def do_plane_transition(flight_img):
     """Top-down airliner silhouette sweeps left→right; new slide revealed behind it."""
