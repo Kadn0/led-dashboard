@@ -1940,6 +1940,11 @@ def main():
         bd.rectangle([(0, MATRIX_HEIGHT - 3), (MATRIX_WIDTH - 1, MATRIX_HEIGHT - 1)], fill=(0, 80, 160))
         display_pil_image(boot)
         time.sleep(2.0)
+        try:
+            first_slide = render_clock()
+            do_plane_transition(first_slide)
+        except Exception as e:
+            print(f"Startup transition error: {e}")
 
         while True:
             now = time.time()
