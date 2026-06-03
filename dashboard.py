@@ -1699,7 +1699,7 @@ def do_plane_transition(flight_img):
         ], fill=col)
 
         _send_raw(ImageEnhance.Brightness(img).enhance(b))
-        time.sleep(0.030)
+        time.sleep(0.040)
 
 
 _file_cache_path = None
@@ -1929,7 +1929,7 @@ def main():
         cached_aqi = aqi_client.fetch()
         weather_fetch_time = time.time()
 
-        # Boot splash
+        # Boot splash with animated progress bar
         cx, cy = MATRIX_WIDTH // 2, MATRIX_HEIGHT // 2
         boot = Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT), (0, 0, 0))
         bd = ImageDraw.Draw(boot)
@@ -1937,9 +1937,21 @@ def main():
         bd.text((cx, cy -  2), "DASHBOARD",   font=get_font(7),  fill=(60, 80, 120),    anchor="mm")
         bd.text((cx, cy +  9), DASHBOARD_VERSION, font=get_font(6), fill=(30, 50, 80), anchor="mm")
         bd.text((cx, cy + 22), DASHBOARD_CREDIT,  font=get_font(6), fill=DASHBOARD_CREDIT_COLOR, anchor="mm")
-        bd.rectangle([(0, MATRIX_HEIGHT - 3), (MATRIX_WIDTH - 1, MATRIX_HEIGHT - 1)], fill=(0, 80, 160))
-        display_pil_image(boot)
-        time.sleep(2.0)
+
+        # Animate the bottom bar as a progress bar over 2 seconds
+        bar_steps = 40
+        for i in range(bar_steps + 1):
+            frame = boot.copy()
+            fd = ImageDraw.Draw(frame)
+            fill_w = int((i / bar_steps) * MATRIX_WIDTH)
+            # Track (dim background)
+            fd.rectangle([(0, MATRIX_HEIGHT - 3), (MATRIX_WIDTH - 1, MATRIX_HEIGHT - 1)], fill=(0, 25, 60))
+            # Fill (bright progress)
+            if fill_w > 0:
+                fd.rectangle([(0, MATRIX_HEIGHT - 3), (fill_w - 1, MATRIX_HEIGHT - 1)], fill=(0, 120, 255))
+            display_pil_image(frame)
+            time.sleep(2.0 / bar_steps)
+
         try:
             first_slide = render_clock()
             do_plane_transition(first_slide)
