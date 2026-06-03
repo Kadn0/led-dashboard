@@ -1,5 +1,34 @@
-#test webhook
 #!/usr/bin/env python3
+# ════════════════════════════════════════════════════════════════════════════════════════
+# LED DASHBOARD — Real-time flight tracking, weather, ISS, Spotify on a 64×64 LED matrix
+# ════════════════════════════════════════════════════════════════════════════════════════
+#
+# FEATURES:
+#   • Flight tracking: Shows aircraft within 25mi, updates every 10-30s from 3 APIs
+#   • ISS tracking: Shows distance to ISS, alerts when overhead (<250mi)
+#   • Weather: Current conditions + forecast, fetched every 30min
+#   • Music: Displays currently-playing Spotify or HomePod track
+#   • Clock: World time in 4 zones (NYC, London, Tokyo, Sydney)
+#   • Photos: Slideshow of photos from ~/led-dashboard/photos/
+#   • Web UI: Control everything via http://pi-ip:8000 (brightness, manual callsign search, etc)
+#
+# ARCHITECTURE:
+#   • Main loop runs at ~2 frames/sec, rotating through slides (clock 20s → weather 5s → ...)
+#   • Flight/weather/ISS data polled in background threads so display never blocks
+#   • Overlays (flights, ISS, music) interrupt the slide rotation with highest priority
+#   • Plane silhouette transition wipes between slides (non-blocking, runs in thread)
+#   • Status file updated every 5s for web dashboard to read
+#
+# CONFIGURATION:
+#   • Location: Hardcoded as Chattanooga, TN (can be auto-detected on startup via IP geolocation)
+#   • Timeouts: 8s for flight APIs, 5s for weather/AQI, 15s for mDNS (HomePod discovery)
+#   • Display: 64×64 RGB matrix via PPM pipe to external display driver (/usr/local/bin/display-bin)
+#   • Web server: Flask on port 8000 (http://pi-ip:8000)
+#
+# NETWORK REQUIREMENTS:
+#   • Internet: Weather, flight APIs, Spotify, ISS position
+#   • Local: mDNS (port 5353) for HomePod discovery, Spotify Zeroconf for local auth
+# ════════════════════════════════════════════════════════════════════════════════════════
 import os, sys, time, requests, base64, hashlib, json, subprocess, math, threading, asyncio, random, socket
 from io import BytesIO
 from datetime import datetime
@@ -2199,56 +2228,81 @@ def main():
                 time.sleep(0.5)
                 continue
 
-            # POLL DATA SOURCES
+            # ─────────────────────────────────────────────────────────────────────────
+            # BACKGROUND POLLING: Keep all data sources fresh in parallel threads
+            # We poll on timers to avoid constant API hammering; each poll runs in a
+            # daemon thread so the main loop never blocks on network I/O.
+            # ─────────────────────────────────────────────────────────────────────────
+
+            # Kick off new flight API queries if the last poll is stale
             if now - last_flight_poll >= FLIGHT_POLL_INTERVAL:
                 last_flight_poll = now
-                flights.start_poll()
+                flights.start_poll()  # Runs 3 parallel API requests in background
 
+            # Kick off ISS position query if stale (and we're not already polling)
             if now - last_iss_poll >= ISS_POLL_INTERVAL and not _iss_polling[0]:
                 last_iss_poll = now
                 def _poll_iss(flag=_iss_polling):
-                    flag[0] = True
+                    flag[0] = True  # Set flag so we don't double-query
                     try: iss.poll()
-                    finally: flag[0] = False
+                    finally: flag[0] = False  # Clear flag when done
                 threading.Thread(target=_poll_iss, daemon=True).start()
 
+            # HomePod: Check if any HomePod is currently playing music
+            # This is non-blocking (just reads cached state from async HomePodManager)
             if homepod:
                 current_homepod = homepod.get_playing()
 
+            # Spotify: Poll Spotify API for currently-playing track
+            # Only poll if: (1) Spotify is auth'd, (2) interval has elapsed, (3) not already polling
             if spotify and now - last_spotify_poll >= SPOTIFY_POLL_INTERVAL and not _sp_box[2]:
                 last_spotify_poll = now
                 def _poll_sp(box=_sp_box):
-                    box[2] = True
+                    box[2] = True  # Set flag: polling in progress
                     try:
-                        box[0] = spotify.get_currently_playing()
+                        box[0] = spotify.get_currently_playing()  # Fetch track info from Spotify
                     except Exception as e:
                         print("Spotify poll error: "+str(e))
-                        box[0] = None   # clear on unexpected error
+                        box[0] = None  # Clear on error so we don't show stale music
                     finally:
-                        box[1] = True   # always signal a new result so current_spotify updates
-                        box[2] = False
+                        box[1] = True   # Signal that new data is ready
+                        box[2] = False  # Clear flag: polling complete
                 threading.Thread(target=_poll_sp, daemon=True).start()
 
+            # Check if Spotify poll just finished and update current_spotify if it did
             if _sp_box[1]:
-                _sp_box[1] = False
-                current_spotify = _sp_box[0]
+                _sp_box[1] = False  # Reset the "new data" flag
+                current_spotify = _sp_box[0]  # Use the freshly polled result
 
-            # PRIORITY 1: FLIGHTS — always beats music; repeats after PLANE_REPEAT_INTERVAL
+            # ─────────────────────────────────────────────────────────────────────────
+            # PRIORITY 1: FLIGHT INTERRUPTS — Show planes in range, highest priority
+            # Flights always interrupt the slide rotation. Each plane shows for
+            # PLANE_DISPLAY_DURATION seconds, then waits PLANE_REPEAT_INTERVAL before
+            # showing again (to avoid spam).
+            # ─────────────────────────────────────────────────────────────────────────
             planes = flights.get_interpolated_planes()
-            last_planes = planes
-            in_range = {p["callsign"] for p in planes}
+            last_planes = planes  # Cache for status file
+            in_range = {p["callsign"] for p in planes}  # Current callsigns in range
+            # Clean up cooldown tracking for planes that have left our airspace
             for cs in [k for k in plane_last_shown if k not in in_range]:
-                del plane_last_shown[cs]  # reset cooldown when plane leaves radius
+                del plane_last_shown[cs]  # Reset so it can be shown again if it re-enters
 
-            # Kick off background route fetches (one thread per callsign, no duplicates)
+            # Kick off background route fetches for any new planes without route info yet
+            # (one thread per callsign, with duplicate-prevention)
             for p in planes:
                 cs = p["callsign"]
                 if cs not in flights.route_cache and cs not in flights._route_pending:
-                    flights._route_pending.add(cs)
+                    flights._route_pending.add(cs)  # Mark as "fetch in progress"
+                    # Fetch route (origin/dest/airline) in background so the flight display
+                    # will be complete when it's shown
                     threading.Thread(target=flights.get_route_info, args=(cs,), daemon=True).start()
 
-            # Manual track: search globally every 10s, show persistently
-            manual_cs = get_manual_track_callsign()
+            # ─────────────────────────────────────────────────────────────────────────
+            # MANUAL FLIGHT SEARCH: User can search for a specific callsign via web UI
+            # If found locally, shows immediately; if not in range, searches globally
+            # via OpenSky API and shows it if found.
+            # ─────────────────────────────────────────────────────────────────────────
+            manual_cs = get_manual_track_callsign()  # Read callsign from web override file
 
             # Show "not found" screen for 4s after timeout, then fully clear
             if manual_not_found_until > 0:
