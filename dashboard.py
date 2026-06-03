@@ -1952,7 +1952,7 @@ def main():
 
         _draw_boot_progress(0.0)
 
-        # Fetch weather + AQI in background so the progress bar reflects real load time
+        # Fetch weather + AQI in background threads — bar reflects actual completion
         weather_box = [None]; aqi_box = [None]; done_flags = [False, False]
         def _fetch_weather():
             try: weather_box[0] = weather.fetch()
@@ -1965,15 +1965,21 @@ def main():
         threading.Thread(target=_fetch_weather, daemon=True).start()
         threading.Thread(target=_fetch_aqi,     daemon=True).start()
 
-        # Animate bar — stays incomplete until both fetches finish (max 12s)
+        # Bar jumps to 50% when weather done, 100% when AQI done.
+        # A slow time-drift keeps it visibly moving within each step.
+        # Hard 12s timeout so a hung fetch never loops forever.
         max_wait = 12.0
         start_t  = time.time()
         while not all(done_flags):
-            elapsed  = time.time() - start_t
-            api_done = sum(done_flags)
-            t_frac   = min(elapsed / max_wait, 1.0)
-            # Weight: each completed API = 45%, time-based drift = 10% (so bar never reaches 100% until done)
-            progress = min(api_done * 0.45 + t_frac * 0.10, 0.99)
+            elapsed = time.time() - start_t
+            if elapsed >= max_wait:
+                break
+            api_done = sum(done_flags)           # 0, 1, or 2
+            # Each completed API = one full step (0→0.5→1.0).
+            # Within each step, time drifts the bar up to 45% of the step.
+            step_size = 1.0 / len(done_flags)    # 0.5
+            drift = min(elapsed / max_wait, 1.0) * step_size * 0.45
+            progress = min(api_done * step_size + drift, 0.98)
             _draw_boot_progress(progress)
             time.sleep(0.05)
 
