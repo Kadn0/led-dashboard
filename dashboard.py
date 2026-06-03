@@ -415,29 +415,54 @@ class HomePodManager:
         self._loop.run_until_complete(self._poll_loop())
 
     async def _scan(self):
-        """Broadcast mDNS scan — discovers all Apple media devices, no IDs needed."""
+        """mDNS broadcast scan to discover HomePods and Apple TVs on the local network.
+
+        This uses Zeroconf (mDNS) to find all compatible devices. The network must allow
+        UDP traffic on port 5353 for this to work. If no devices are found, check:
+        - Is mDNS/Bonjour enabled on your router?
+        - Are your devices on the same network as the Pi?
+        - Are there firewall rules blocking port 5353?
+        """
         try:
+            # Scan network for all Apple devices (15s timeout)
             found = await asyncio.wait_for(pyatv.scan(self._loop), timeout=15)
+            if not found:
+                print("  → No Apple devices found on network (mDNS scan returned empty)")
+                self._last_scan = time.time()
+                return
+
+            print(f"  → mDNS scan found {len(found)} device(s)")
             for device in found:
                 ident = device.identifier
-                # Determine model name
+                # Extract device model name (e.g., "HomePod", "HomePodMini", "AppleTV4KGen3")
                 model_name = ""
                 try:
                     if device.device_info and device.device_info.model:
                         model_name = device.device_info.model.name
                 except Exception:
                     pass
-                # Log every device found so model mismatches are visible in console
-                print(f"pyatv found: {device.name!r} model={model_name!r} [{ident}]")
+
+                # Log every device found (even if we don't support it) so user can debug model mismatches
+                print(f"     Device: {device.name!r} | Model: {model_name!r} | ID: {ident}")
+
+                # Skip if we've already cached this device
                 if ident in self._cfgs:
                     continue
+
+                # Only add devices we recognize (HomePod/AppleTV models)
                 if model_name not in _MEDIA_DEVICE_MODELS:
+                    print(f"       ⚠ Model '{model_name}' not in supported list (won't use for music)")
                     continue
+
+                # Device is supported — save it for polling
                 self._cfgs[ident] = device
                 dtype = "appletv" if model_name in _ATV_MODELS else "homepod"
-                print(f"Discovered {dtype}: {device.name} ({model_name}) [{ident}]")
+                print(f"       ✓ Added {dtype}: {device.name}")
+        except asyncio.TimeoutError:
+            print(f"  → mDNS scan timed out after 15s (network may be slow or mDNS blocked)")
         except Exception as e:
-            print(f"HomePod scan error: {e}")
+            print(f"  → mDNS scan error: {e}")
+
         self._last_scan = time.time()
 
     def _dtype_for(self, ident):
@@ -1636,8 +1661,13 @@ def do_transition():
         _send_raw(ImageEnhance.Brightness(img).enhance(b))
         time.sleep(0.025)
 
+def do_plane_transition_async(flight_img):
+    """Non-blocking wrapper: spawn plane transition in background thread."""
+    threading.Thread(target=do_plane_transition, args=(flight_img,), daemon=True).start()
+
 def do_plane_transition(flight_img):
-    """Top-down airliner silhouette sweeps left→right; new slide revealed behind it."""
+    """Top-down airliner silhouette sweeps left→right; new slide revealed behind it.
+    NOTE: This blocks for ~2.8s. Call via do_plane_transition_async() to avoid blocking the main loop."""
     b  = get_brightness()
     W, H = MATRIX_WIDTH, MATRIX_HEIGHT
     mid = H // 2   # 32
@@ -1877,10 +1907,19 @@ def main():
     else:
         print(f"Location: using config ({CHATTANOOGA_LAT:.4f}, {CHATTANOOGA_LON:.4f})")
 
-    # ── HomePod / Apple TV: auto-discover via mDNS, no static IDs needed ──
-    homepod = HomePodManager() if HAS_PYATV else None
+    # ── HomePod / Apple TV: auto-discover via mDNS ──
+    # mDNS scanning allows us to find any HomePod/AppleTV on the local network without hardcoded IPs.
+    # This requires: (1) pyatv library installed, (2) mDNS working on the network (port 5353 open)
+    # If mDNS fails, music detection from HomePod won't work but the rest of the dashboard continues.
+    homepod = None
     if HAS_PYATV:
-        print("HomePod/AppleTV auto-discovery started (scanning network…)")
+        try:
+            homepod = HomePodManager()
+            print("HomePod/AppleTV auto-discovery started (mDNS scan in progress…)")
+        except Exception as e:
+            print(f"HomePod init failed (mDNS may be blocked on this network): {e}")
+    else:
+        print("pyatv not installed — HomePod detection disabled")
     flights = FlightTracker()
     weather = WeatherClient()
     aqi_client = AirQualityClient()
@@ -2003,15 +2042,43 @@ def main():
         except Exception as e:
             print(f"Startup transition error: {e}")
 
+        # ════════════════════════════════════════════════════════════════════════════════
+        # MAIN EVENT LOOP — Display content and handle real-time data updates
+        # ════════════════════════════════════════════════════════════════════════════════
+        # This loop runs continuously and:
+        #   1. Rotates through slides (clock → weather → sun → photos) on a timer
+        #   2. Shows persistent overlays when conditions are met (flights when overhead,
+        #      ISS when in range, music when playing)
+        #   3. Polls APIs in background threads (flights, weather, ISS, HomePod)
+        #   4. Handles user overrides (manual callsign search, slide locks, brightness)
+        #   5. Updates a status file every 5s for the web dashboard to read
+        #
+        # Display priority (top to bottom):
+        #   - Slide lock (if user locked to a specific slide, only show that)
+        #   - Flight overlay (plane in range + manual search take priority)
+        #   - ISS overlay (when overhead)
+        #   - Music overlay (current Spotify or HomePod track)
+        #   - Base slides (clock, weather, sun, photos on rotation)
+        #
+        # Each slide rotates every SLOT_DURATION seconds (clock 20s, weather 5s, sun 5s, photos 20s)
+        # ════════════════════════════════════════════════════════════════════════════════
+
         while True:
             now = time.time()
 
-            # Status file — always update every 5s using last-known data
+            # ─────────────────────────────────────────────────────────────────────────
+            # Every 5s, write a status file for the web server to read
+            # This includes current music, flights in range, ISS state, weather, etc.
+            # ─────────────────────────────────────────────────────────────────────────
             if now - last_status_write >= 5:
                 last_status_write = now
                 _write_status(current_spotify or current_homepod, last_planes, flights, iss, cached_weather)
 
-            # Check slide lock — if set, override everything (flights, music, ISS)
+            # ─────────────────────────────────────────────────────────────────────────
+            # Check for user overrides from the web dashboard
+            # Overrides include: slide lock (force a specific slide), manual callsign search,
+            # forced photo display, brightness override, and disabled slide categories
+            # ─────────────────────────────────────────────────────────────────────────
             ov = get_override()
             disabled_slots = set(ov.get("disabled_slides") or [])
             slide_lock = ov.get("slide_lock")
@@ -2074,24 +2141,37 @@ def main():
                         last_render = now
 
                 elif cs_slot == "flights":
-                    # Poll flights so the display stays live
+                    # ─────────────────────────────────────────────────────────────────
+                    # FLIGHTS SLIDE: Show aircraft within 25mi of location
+                    # Every FLIGHT_POLL_INTERVAL seconds (typically 10-30s), we query 3
+                    # flight tracking APIs in parallel (adsblol, airplanes.live, adsbfi)
+                    # in a background thread so the display doesn't freeze.
+                    # ─────────────────────────────────────────────────────────────────
                     if now - last_flight_poll >= FLIGHT_POLL_INTERVAL:
                         last_flight_poll = now
-                        flights.start_poll()
+                        flights.start_poll()  # Spawn background thread with 3 parallel API requests
+
+                    # Get interpolated flight list (positions updated smoothly between API calls)
                     planes = flights.get_interpolated_planes()
-                    last_planes = planes
+                    last_planes = planes  # Cache for status file
+
+                    # For each new plane, fetch its route (origin/dest) in background so we
+                    # have full details before showing it
                     for p in planes:
                         _cs = p["callsign"]
                         if _cs not in flights.route_cache and _cs not in flights._route_pending:
                             flights._route_pending.add(_cs)
                             threading.Thread(target=flights.get_route_info, args=(_cs,), daemon=True).start()
+
                     if planes:
+                        # Rotate through planes every 6 seconds (shows each plane at least once)
                         idx = int(now / 6) % len(planes)
                         p = planes[idx]
                         _cs = p["callsign"]
                         route = flights.route_cache.get(_cs) or {"origin":None,"dest":None,"airline_icao":None,"airline_name":None,"expiry":0}
                         display_pil_image(render_flight_image(p, route))
                     else:
+                        # No flights in range — show "NO FLIGHTS" screen
                         img = Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT), (0, 0, 0))
                         d2 = ImageDraw.Draw(img)
                         d2.text((32, 22), "NO", font=get_font(16), fill=(55, 55, 75), anchor="mm")
@@ -2100,7 +2180,12 @@ def main():
                     last_render = now
 
                 elif cs_slot == "iss":
-                    # Poll ISS so the display stays live
+                    # ─────────────────────────────────────────────────────────────────
+                    # ISS SLIDE: Show International Space Station state
+                    # Every ISS_POLL_INTERVAL seconds (typically 10-30s), we query the
+                    # open-notify.org API in a background thread to get current ISS position
+                    # and calculate distance from our location.
+                    # ─────────────────────────────────────────────────────────────────
                     if now - last_iss_poll >= ISS_POLL_INTERVAL and not _iss_polling[0]:
                         last_iss_poll = now
                         def _poll_iss_lock(flag=_iss_polling):
@@ -2266,7 +2351,8 @@ def main():
                     current_plane_show_start = now
                     # plane_last_shown set AFTER display completes, not on detection
                     print("PLANE: "+cs+" "+str(round(p["distance"],1))+"mi "+str(p["altitude_ft"])+"ft")
-                    do_plane_transition(render_flight_image(p, route))
+                    # Run plane transition in background so main loop (clock display) isn't blocked
+                    do_plane_transition_async(render_flight_image(p, route))
                     if route.get("origin") and route.get("dest"):
                         print("  "+route["origin"]+" -> "+route["dest"])
                 if now - current_plane_show_start < PLANE_DISPLAY_DURATION:
