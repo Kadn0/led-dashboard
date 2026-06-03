@@ -1215,8 +1215,8 @@ def render_iss(iss):
             draw.point((sx, sy), fill=(sb, sb, min(sb + 20, 255)))
 
     # ISS label
-    draw.text((32, 5), "ISS", font=get_font(8), fill=(100, 220, 255), anchor="mm")
-    draw.text((32, 13), "OVERHEAD", font=get_font(6), fill=(255, 200, 80), anchor="mm")
+    draw.text((32, 5), "ISS", font=get_font(9), fill=(120, 230, 255), anchor="mm")
+    draw.text((32, 13), "OVERHEAD", font=get_font(7), fill=(255, 215, 70), anchor="mm")
 
     # ── ISS silhouette — compact, centered at (32, 24) ──────────────────
     cx, cy = 32, 24
@@ -1253,8 +1253,8 @@ def render_iss(iss):
         dist_str = f"{int(iss.distance):,} mi away"
         bbox = draw.textbbox((0, 0), dist_str, font=get_font(7))
         draw.text(((64 - (bbox[2]-bbox[0])) // 2, 33), dist_str, font=get_font(7), fill=(255, 255, 255))
-    draw.text((32, 44), "17,500 mph", font=get_font(6), fill=(120, 180, 255), anchor="mm")
-    draw.text((32, 54), "~250 mi up", font=get_font(6), fill=(100, 140, 220), anchor="mm")
+    draw.text((32, 44), "17,500 mph", font=get_font(7), fill=(160, 210, 255), anchor="mm")
+    draw.text((32, 54), "~250 mi up", font=get_font(7), fill=(140, 190, 255), anchor="mm")
     return img
 
 def render_flight_image(plane, route):
