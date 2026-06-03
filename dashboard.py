@@ -1652,60 +1652,61 @@ def do_plane_transition(flight_img):
     frames = 52
     for frame in range(frames):
         t = frame / (frames - 1)
-        # Nose sweeps from fully off-screen-left to fully off-screen-right
         nose_x = int(t * (W + plane_len)) - plane_len
 
-        # Old slide on right, new slide revealed left of the nose — plane rides the boundary
-        img = from_img.copy()
-        if nose_x > 0:
-            img.paste(flight_img.crop((0, 0, min(nose_x, W), H)), (0, 0))
+        # Wing leading edge: root at (nx-10, mid), tips at (nx-26, 0) and (nx-26, H-1)
+        # Use this chevron as the wipe mask — new slide left, old slide right, plane on top
+        wl_root = nose_x - 10   # x where wing leading edge meets fuselage
+        wl_tip  = nose_x - 26   # x where wing leading edge reaches screen top/bottom
 
-        d = ImageDraw.Draw(img)
-        nx = nose_x  # shorthand
+        mask = Image.new("L", (W, H), 0)
+        md   = ImageDraw.Draw(mask)
+        # Chevron polygon: left region = new slide
+        md.polygon([
+            (0,           0),
+            (max(0, min(wl_tip,  W)), 0),
+            (max(0, min(wl_root, W)), mid),
+            (max(0, min(wl_tip,  W)), H - 1),
+            (0,           H - 1),
+        ], fill=255)
+        img = Image.composite(flight_img, from_img, mask)
+
+        d  = ImageDraw.Draw(img)
+        nx = nose_x
 
         # ── Fuselage ─────────────────────────────────────────────────────
         d.polygon([
-            pt(nx,  0,  0),    # nose tip
-            pt(nx, -3, -3),    # nose shoulder upper
-            pt(nx,-41, -3),    # tail upper
-            pt(nx,-44,  0),    # tail tip
-            pt(nx,-41,  3),    # tail lower
-            pt(nx, -3,  3),    # nose shoulder lower
+            pt(nx,  0,  0),
+            pt(nx, -3, -3),
+            pt(nx,-41, -3),
+            pt(nx,-44,  0),
+            pt(nx,-41,  3),
+            pt(nx, -3,  3),
         ], fill=col)
 
-        # ── Main wings — sweep back, span full screen height ─────────────
+        # ── Main wings — leading edge IS the wipe boundary ───────────────
         d.polygon([             # upper wing
-            pt(nx, -10, -3),   # root leading
-            pt(nx, -26, -mid), # wingtip leading  (y = 0)
-            pt(nx, -30, -mid), # wingtip trailing (y = 0)
-            pt(nx, -20, -3),   # root trailing
+            pt(nx, -10, -3),
+            pt(nx, -26, -mid),
+            pt(nx, -30, -mid),
+            pt(nx, -20, -3),
         ], fill=col)
         d.polygon([             # lower wing
             pt(nx, -10,  3),
-            pt(nx, -26,  mid - 1),  # y = 63
+            pt(nx, -26,  mid - 1),
             pt(nx, -30,  mid - 1),
             pt(nx, -20,  3),
         ], fill=col)
 
-        # ── Engine nacelles (2 per wing, rectangular pods) ───────────────
-        for ey, ew in [(-10, -7), (-21, -18)]:   # upper wing (ey < ew → y0 < y1 ✓)
+        # ── Engine nacelles ───────────────────────────────────────────────
+        for ey, ew in [(-10, -7), (-21, -18)]:
             d.rectangle([pt(nx, -13, ey), pt(nx, -10, ew)], fill=col)
-        for ey, ew in [(7, 10), (18, 21)]:        # lower wing (ey < ew → y0 < y1 ✓)
+        for ey, ew in [(7, 10), (18, 21)]:
             d.rectangle([pt(nx, -13, ey), pt(nx, -10, ew)], fill=col)
 
         # ── Horizontal tail stabilizers ───────────────────────────────────
-        d.polygon([
-            pt(nx, -35, -3),
-            pt(nx, -38, -3),
-            pt(nx, -42, -12),
-            pt(nx, -39, -12),
-        ], fill=col)
-        d.polygon([
-            pt(nx, -35,  3),
-            pt(nx, -38,  3),
-            pt(nx, -42,  12),
-            pt(nx, -39,  12),
-        ], fill=col)
+        d.polygon([pt(nx,-35,-3), pt(nx,-38,-3), pt(nx,-42,-12), pt(nx,-39,-12)], fill=col)
+        d.polygon([pt(nx,-35, 3), pt(nx,-38, 3), pt(nx,-42, 12), pt(nx,-39, 12)], fill=col)
 
         _send_raw(ImageEnhance.Brightness(img).enhance(b))
         time.sleep(0.040)
