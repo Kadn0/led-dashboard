@@ -29,12 +29,48 @@
 #   • Internet: Weather, flight APIs, Spotify, ISS position
 #   • Local: mDNS (port 5353) for HomePod discovery, Spotify Zeroconf for local auth
 # ════════════════════════════════════════════════════════════════════════════════════════
+"""
+╔════════════════════════════════════════════════════════════════════════════╗
+║                    LED DASHBOARD FOR RASPBERRY PI 4                        ║
+║                                                                            ║
+║  Real-time display showing:                                              ║
+║  • Flight tracking (ADS-B data from 3 APIs)                             ║
+║  • Weather & AQI                                                          ║
+║  • ISS position tracking                                                  ║
+║  • Spotify & HomePod music                                               ║
+║  • World clock                                                            ║
+║  • Photo slideshow                                                        ║
+║                                                                            ║
+║  Architecture:                                                            ║
+║  • Main loop: ~2 fps, never blocks on network (all async/threaded)       ║
+║  • Background threads: API polling, image downloads, HomePod discovery   ║
+║  • Smart caching: Image, weather, flight data cached to avoid lag       ║
+║  • Optimizations: Connection pooling, timeouts, resource cleanup         ║
+╚════════════════════════════════════════════════════════════════════════════╝
+"""
+
 import os, sys, time, requests, base64, hashlib, json, subprocess, math, threading, asyncio, random, socket
 from io import BytesIO
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 from pathlib import Path
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# ─────────────────────────────────────────────────────────────────────────
+# HTTP SESSION WITH CONNECTION POOLING (prevents lag from creating new connections)
+# ─────────────────────────────────────────────────────────────────────────
+def _create_session():
+    """Create requests session with connection pooling and retries."""
+    session = requests.Session()
+    retry_strategy = Retry(total=2, backoff_factor=0.1, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+_session = _create_session()  # Reuse across all HTTP calls
 
 try:
     import pyatv
@@ -53,6 +89,7 @@ from dashboard_config import (
     LOCATION_LAT as CHATTANOOGA_LAT,
     LOCATION_LON as CHATTANOOGA_LON,
     LOCATION_TZ,
+    LOCATION_NAME,          # human-readable city name used as geo fallback
     USER_FACING_DEG,
     DASHBOARD_VERSION, DASHBOARD_CREDIT, DASHBOARD_CREDIT_COLOR,
     CLOCK_TIMEZONES,
@@ -72,15 +109,23 @@ from dashboard_config import (
 
 _PID_FILE = PID_FILE
 def _acquire_pid_lock():
+    """Single-instance guard: if a previous dashboard is still running, signal it
+    to exit before we take over the display pipe (two writers = flicker)."""
     if os.path.exists(_PID_FILE):
         try:
-            old_pid = int(open(_PID_FILE).read().strip())
-            os.kill(old_pid, 0)
+            with open(_PID_FILE) as _pf:
+                old_pid = int(_pf.read().strip())
+            os.kill(old_pid, 0)            # raises if the pid is gone
             print(f"Another dashboard instance (pid {old_pid}) is running. Killing it.")
             os.kill(old_pid, 15)
             time.sleep(1)
         except (ProcessLookupError, ValueError):
-            pass
+            pass                          # stale/garbage pid file — safe to overwrite
+        except PermissionError:
+            # The pid exists but is owned by another user (we can't signal it).
+            # It's clearly a live process, so don't fight it — just record ours and
+            # carry on rather than crashing the whole dashboard on startup.
+            print(f"Existing pid {old_pid} owned by another user; continuing.")
     with open(_PID_FILE, "w") as f:
         f.write(str(os.getpid()))
 
@@ -94,31 +139,50 @@ _DEFAULT_SEGMENTS = [
     {"bright": 0},
 ]
 
+# get_brightness() runs twice per displayed frame, and it calls
+# get_bright_schedule(). Without caching, that would re-read + JSON-parse the
+# schedule file from disk on every frame (~4 reads/sec) — pointless I/O that
+# can stutter under load. We cache the parsed schedule for 2s; the web UI only
+# changes it occasionally, so a 2s lag in picking up edits is imperceptible.
+_bright_schedule_cache = None
+_bright_schedule_cache_time = 0.0
+
 def get_bright_schedule():
     """Returns {"segments": [{bright, end?}, ...]} — last entry has no 'end' (→ 24:00).
-    Reads the new flexible format, or converts the legacy 4-key format on the fly."""
+    Reads the new flexible format, or converts the legacy 4-key format on the fly.
+    Result is cached for 2s to avoid per-frame disk reads."""
+    global _bright_schedule_cache, _bright_schedule_cache_time
+    # Serve from cache if fresh
+    if _bright_schedule_cache is not None and time.time() - _bright_schedule_cache_time < 2.0:
+        return _bright_schedule_cache
+    result = {"segments": list(_DEFAULT_SEGMENTS)}  # safe default
     try:
         if os.path.exists(BRIGHT_SCHEDULE_FILE):
-            data = json.loads(open(BRIGHT_SCHEDULE_FILE).read())
+            with open(BRIGHT_SCHEDULE_FILE) as _bsf:
+                data = json.loads(_bsf.read())
             if isinstance(data.get("segments"), list) and data["segments"]:
-                return data
-            # Convert legacy 4-period format
-            s = {**_DEFAULT_SCHEDULE, **data}
-            return {"segments": [
-                {"end": float(s["night_end"]),   "bright": int(s["night_bright"])},
-                {"end": float(s["morning_end"]), "bright": int(s["morning_bright"])},
-                {"end": float(s["day_end"]),     "bright": int(s["day_bright"])},
-                {"end": float(s["evening_end"]), "bright": int(s["evening_bright"])},
-                {"bright": int(s["night_bright"])},
-            ]}
+                result = data
+            else:
+                # Convert legacy 4-period format → segment list
+                s = {**_DEFAULT_SCHEDULE, **data}
+                result = {"segments": [
+                    {"end": float(s["night_end"]),   "bright": int(s["night_bright"])},
+                    {"end": float(s["morning_end"]), "bright": int(s["morning_bright"])},
+                    {"end": float(s["day_end"]),     "bright": int(s["day_bright"])},
+                    {"end": float(s["evening_end"]), "bright": int(s["evening_bright"])},
+                    {"bright": int(s["night_bright"])},
+                ]}
     except Exception:
-        pass
-    return {"segments": list(_DEFAULT_SEGMENTS)}
+        pass  # fall back to default on any parse/read error
+    _bright_schedule_cache = result
+    _bright_schedule_cache_time = time.time()
+    return result
 
 def get_manual_track_callsign():
     try:
         if os.path.exists(MANUAL_TRACK_FILE):
-            d = json.loads(open(MANUAL_TRACK_FILE).read())
+            with open(MANUAL_TRACK_FILE) as _mtf:
+                d = json.loads(_mtf.read())
             return d.get("callsign")
     except Exception:
         pass
@@ -142,9 +206,11 @@ CACHE_DIR.mkdir(exist_ok=True)
 LOGO_CACHE_DIR.mkdir(exist_ok=True)
 PHOTOS_DIR.mkdir(exist_ok=True)
 
+# Remove stale "miss" marker files from a previous run so fresh logo lookups
+# are attempted on the next boot (the miss file blocks retries for that session).
 for miss in LOGO_CACHE_DIR.glob("*.miss"):
     try: miss.unlink()
-    except: pass
+    except Exception: pass
 
 ART_PREFIXES = ("homepod_", "spotify_", "album_", "art_")
 
@@ -177,8 +243,10 @@ def _write_status(music, planes, flights_tracker, iss_tracker, weather):
         if iss_tracker and iss_tracker.distance is not None:
             iss_data = {
                 "distance": int(iss_tracker.distance),
-                "lat": round(iss_tracker.lat, 2) if iss_tracker.lat else None,
-                "lon": round(iss_tracker.lon, 2) if iss_tracker.lon else None,
+                # Use "is not None" — a value of exactly 0.0 (equator / prime
+                # meridian) is valid and must not be coerced to None.
+                "lat": round(iss_tracker.lat, 2) if iss_tracker.lat is not None else None,
+                "lon": round(iss_tracker.lon, 2) if iss_tracker.lon is not None else None,
                 "overhead": iss_tracker.distance < ISS_OVERHEAD_RADIUS_MILES and iss_tracker.is_fresh(),
                 "fresh": iss_tracker.is_fresh(),
             }
@@ -218,7 +286,7 @@ def cleanup_art_cache(max_files=200, max_mb=50):
             keep += 1; total += sz
         for f, _, _ in files[keep:]:
             try: f.unlink()
-            except: pass
+            except Exception: pass
         if len(files) - keep > 0:
             print(f"Art cache: removed {len(files)-keep} old files, kept {keep} ({total//1024//1024}MB)")
     except Exception as e:
@@ -273,12 +341,9 @@ ICAO_TO_IATA = {
     "WJA":"WS","CAL":"CI","EVA":"BR","FJI":"FJ","PIA":"PK","GBL":"GT","CHQ":"BW",
 }
 
-CLOCK_TIMEZONES = [
-    ("EST","America/New_York",(255,255,100)),
-    ("CST","America/Chicago",(200,255,200)),
-    ("UTC","UTC",(180,220,255)),
-    ("LON","Europe/London",(255,150,200)),
-]
+# NOTE: CLOCK_TIMEZONES is already imported from dashboard_config above.
+# The duplicate definition that used to live here has been removed to avoid
+# silent divergence if the config copy is ever edited.
 
 WEATHER_LABELS = {
     0:"Clear",1:"Clear",2:"PtCloud",3:"Cloudy",45:"Fog",48:"Fog",
@@ -298,7 +363,8 @@ def get_override():
         return _override_cache
     try:
         if os.path.exists(OVERRIDE_FILE):
-            _override_cache = json.loads(open(OVERRIDE_FILE).read())
+            with open(OVERRIDE_FILE) as _ovf:
+                _override_cache = json.loads(_ovf.read())
             _override_cache_time = time.time()
             return _override_cache
     except Exception:
@@ -320,7 +386,8 @@ def get_brightness():
             if t < seg.get("end", 24):
                 return max(0.0, min(1.0, seg["bright"] / 100.0))
         return max(0.0, min(1.0, segs[-1]["bright"] / 100.0))
-    except:
+    except Exception:
+        # Any parse/math error: default to full brightness so the display stays on
         return 1.0
 
 def apply_dimming(img):
@@ -374,7 +441,7 @@ def get_airline_logo(icao, iata=None):
     if miss.exists(): return None
     if cf.exists():
         try: return Image.open(cf)
-        except: pass
+        except Exception: pass  # corrupt cache file — fall through to re-download
 
     # Resolve IATA code: prefer caller-supplied, then static map
     if not iata:
@@ -395,7 +462,7 @@ def get_airline_logo(icao, iata=None):
 
     for url in sources:
         try:
-            r = requests.get(url, timeout=4)
+            r = _session.get(url, timeout=4)
             if r.status_code != 200 or len(r.content) < 300:
                 continue
             img = Image.open(BytesIO(r.content))
@@ -427,7 +494,7 @@ class HomePodManager:
     """Auto-discovers all HomePods and Apple TVs on the local network via mDNS.
     No static device IDs needed — just start it and it finds whatever is there."""
 
-    RESCAN_INTERVAL = 60   # seconds between full network re-scans
+    RESCAN_INTERVAL = 30   # seconds between full network re-scans (was 60, lowered to pick up new devices faster)
 
     def __init__(self):
         self._loop = asyncio.new_event_loop()
@@ -506,10 +573,16 @@ class HomePodManager:
             return None
         if ident not in self._conns:
             try:
+                cfg = self._cfgs[ident]
+                name = cfg.name if hasattr(cfg, 'name') else ident
                 self._conns[ident] = await asyncio.wait_for(
-                    pyatv.connect(self._cfgs[ident], self._loop), timeout=5)
+                    pyatv.connect(cfg, self._loop), timeout=5)
+                print(f"[HomePod] Connected to {name}")
+            except asyncio.TimeoutError:
+                print(f"[HomePod] Connection timeout to {ident}")
+                return None
             except Exception as e:
-                print(f"Device connect {ident}: {e}")
+                print(f"[HomePod] Connect error {ident}: {type(e).__name__}: {str(e)[:80]}")
                 return None
         return self._conns[ident]
 
@@ -520,7 +593,10 @@ class HomePodManager:
                 return None
             info = await asyncio.wait_for(conn.metadata.playing(), timeout=3)
             state = str(info.device_state)
-            if "Playing" not in state or not info.title:
+            if "Playing" not in state:
+                # Not playing — this is normal, just return None silently
+                return None
+            if not info.title:
                 return None
             dtype = self._dtype_for(ident)
             r = {"title": info.title, "artist": info.artist or "",
@@ -532,8 +608,12 @@ class HomePodManager:
             except Exception:
                 pass
             return r
+        except asyncio.TimeoutError:
+            print(f"Device poll {ident}: timeout connecting/polling")
+            self._conns.pop(ident, None)
+            return None
         except Exception as e:
-            print(f"Device poll {ident}: {e}")
+            print(f"Device poll {ident}: {type(e).__name__}: {e}")
             self._conns.pop(ident, None)
             return None
 
@@ -546,9 +626,11 @@ class HomePodManager:
 
             idents = list(self._cfgs.keys())
             if idents:
+                print(f"[HomePod] Polling {len(idents)} device(s)")
                 results = await asyncio.gather(
                     *[self._poll_one(i) for i in idents],
                     return_exceptions=True)
+                print(f"[HomePod] Poll results: {len([r for r in results if isinstance(r, dict) and r])} playing")
             else:
                 results = []
             playing = next((r for r in results if isinstance(r, dict) and r), None)
@@ -559,7 +641,7 @@ class HomePodManager:
                     af = CACHE_DIR / (playing["dtype"]+"_"+ah+".jpg")
                     if not af.exists():
                         try: Image.open(BytesIO(playing["artwork"])).save(af, "JPEG")
-                        except: pass
+                        except Exception: pass  # bad artwork bytes — skip art, still show track info
                     if af.exists(): ap = str(af)
                 final = {"track": playing["title"], "artist": playing["artist"],
                          "image_url": ap, "source": playing["dtype"], "is_local_file": True}
@@ -582,7 +664,9 @@ class SpotifyClient:
     def refresh_access_token(self):
         auth = base64.b64encode((self.cid+":"+self.csec).encode()).decode()
         try:
-            r = requests.post("https://accounts.spotify.com/api/token",
+            # Use the shared pooled session (reuses the TLS connection to
+            # accounts.spotify.com) instead of a one-off requests.post.
+            r = _session.post("https://accounts.spotify.com/api/token",
                 headers={"Authorization":"Basic "+auth,"Content-Type":"application/x-www-form-urlencoded"},
                 data={"grant_type":"refresh_token","refresh_token":self.rtok}, timeout=5)
             r.raise_for_status(); d = r.json()
@@ -602,7 +686,7 @@ class SpotifyClient:
             if not self.refresh_access_token():
                 return None   # token refresh failed — clear display rather than freeze
         try:
-            r = requests.get("https://api.spotify.com/v1/me/player/currently-playing",
+            r = _session.get("https://api.spotify.com/v1/me/player/currently-playing",
                 headers={"Authorization":"Bearer "+self.access_token}, timeout=4)
             if r.status_code == 429:
                 retry_after = int(r.headers.get("Retry-After", "30"))
@@ -630,11 +714,74 @@ class SpotifyClient:
 
 # ========== WEATHER + AQI + SUN ==========
 class WeatherClient:
+    # wttr.in code → WMO code used by draw_small_weather_icon
+    _WTTR_TO_WMO = {
+        113:0, 116:2, 119:3, 122:3, 143:45, 248:45, 260:48,
+        176:61, 293:61, 296:61, 263:51, 266:53, 281:55, 284:55, 185:55,
+        299:63, 302:63, 305:65, 308:65, 353:80, 356:81, 359:82,
+        179:71, 323:71, 326:71, 317:71, 320:73, 329:73, 332:73,
+        335:75, 338:75, 227:75, 230:75, 182:77, 311:77, 314:77,
+        350:77, 374:77, 377:77, 362:85, 368:85, 365:86, 371:86,
+        200:95, 386:95, 389:96, 392:96, 395:99,
+    }
     def __init__(self):
-        self.cache = None; self.cache_time = 0
+        self.cache = None; self.cache_time = 0; self.retry_after = 0
+        self._load_disk()
+    def _disk_path(self):
+        return CACHE_DIR / "weather_data.json"
+    def _load_disk(self):
+        try:
+            p = self._disk_path()
+            if p.exists():
+                d = json.loads(p.read_text())
+                self.cache = d.get("data")
+                self.cache_time = d.get("time", 0)
+                print("Weather: loaded from disk cache")
+        except Exception: pass
+    def _save_disk(self):
+        try:
+            self._disk_path().write_text(json.dumps({"data": self.cache, "time": self.cache_time}))
+        except Exception: pass
+    def _parse_wttr(self, j):
+        """Parse wttr.in JSON into the same dict shape as open-meteo."""
+        day_names = ["MON","TUE","WED","THU","FRI","SAT","SUN"]
+        cur = j["current_condition"][0]
+        days = []
+        for i, day in enumerate(j.get("weather", [])[:3]):
+            try: lbl = "Now" if i == 0 else day_names[datetime.fromisoformat(day["date"]).weekday()]
+            except Exception: lbl = "?"
+            # midday hourly slot (index 4 = 12:00) for the day icon code
+            raw_code = int((day.get("hourly") or [{}]*5)[4].get("weatherCode", 113))
+            days.append({"label": lbl,
+                         "high": float(day["maxtempF"]),
+                         "low":  float(day["mintempF"]),
+                         "code": self._WTTR_TO_WMO.get(raw_code, 0)})
+        # expand 8 three-hour UV samples → 24 hourly by repeating each 3×
+        hourly_uv = []
+        for h in (j.get("weather") or [{}])[0].get("hourly", []):
+            val = float(h.get("uvIndex", 0))
+            hourly_uv += [val, val, val]
+        hourly_uv = (hourly_uv + [0]*24)[:24]
+        raw_cur_code = int(cur.get("weatherCode", 113))
+        return {
+            "current_temp":       float(cur["temp_F"]),
+            "current_feels":      float(cur["FeelsLikeF"]),
+            "current_code":       self._WTTR_TO_WMO.get(raw_cur_code, 0),
+            "current_uv":         float(cur.get("uvIndex", 0)),
+            "current_humidity":   float(cur.get("humidity", 0)),
+            "current_wind_speed": float(cur.get("windspeedMiles", 0)),
+            "current_wind_dir":   float(cur.get("winddirDegree", 0)),
+            "current_precip":     float(cur.get("precipInches", 0)),
+            "days": days,
+            "hourly_uv": hourly_uv,
+        }
     def fetch(self):
-        if self.cache and time.time() - self.cache_time < WEATHER_POLL_INTERVAL:
+        now = time.time()
+        if self.cache and now - self.cache_time < WEATHER_POLL_INTERVAL:
             return self.cache
+        if now < self.retry_after:
+            return self.cache
+        # ── Primary: open-meteo ──────────────────────────────────────────
         try:
             url = ("https://api.open-meteo.com/v1/forecast?latitude="+str(CHATTANOOGA_LAT)+
                    "&longitude="+str(CHATTANOOGA_LON)+
@@ -642,7 +789,8 @@ class WeatherClient:
                    "&daily=temperature_2m_max,temperature_2m_min,weather_code"+
                    "&hourly=uv_index"+
                    "&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone="+LOCATION_TZ+"&forecast_days=3")
-            r = requests.get(url, timeout=5); r.raise_for_status()
+            r = _session.get(url, timeout=5); r.raise_for_status()
+            if r.json().get("error"): raise Exception(r.json().get("reason","open-meteo error"))
             j = r.json()
             cur = j.get("current",{}); daily = j.get("daily",{}); hourly = j.get("hourly",{})
             day_names = ["MON","TUE","WED","THU","FRI","SAT","SUN"]
@@ -653,7 +801,7 @@ class WeatherClient:
                 try:
                     dt = datetime.fromisoformat(ta[i])
                     lbl = "Now" if i == 0 else day_names[dt.weekday()]
-                except: lbl = "?"
+                except Exception: lbl = "?"
                 days.append({"label":lbl,"high":ha[i] if i<len(ha) else None,
                             "low":la[i] if i<len(la) else None,
                             "code":ca[i] if i<len(ca) else None})
@@ -667,52 +815,140 @@ class WeatherClient:
                          "current_precip":cur.get("precipitation"),
                          "days":days,
                          "hourly_uv": hourly.get("uv_index",[])[:24]}
-            self.cache_time = time.time()
-            print("Weather: "+str(int(self.cache["current_temp"]))+"F UV="+str(self.cache["current_uv"]))
+            self.cache_time = time.time(); self.retry_after = 0
+            self._save_disk()
+            print("Weather (open-meteo): "+str(int(self.cache["current_temp"]))+"F")
             return self.cache
         except Exception as e:
-            print("Weather error: "+str(e)); return self.cache
+            print("Weather open-meteo error: "+str(e))
+        # ── Fallback: wttr.in ────────────────────────────────────────────
+        try:
+            r = _session.get(
+                "https://wttr.in/"+LOCATION_NAME.replace(" ","+")+"?format=j1",
+                timeout=8)
+            r.raise_for_status()
+            self.cache = self._parse_wttr(r.json())
+            self.cache_time = time.time(); self.retry_after = 0
+            self._save_disk()
+            print("Weather (wttr.in): "+str(int(self.cache["current_temp"]))+"F")
+            return self.cache
+        except Exception as e:
+            print("Weather wttr.in error: "+str(e))
+            self.retry_after = time.time() + 120
+            return self.cache
 
 class AirQualityClient:
     def __init__(self):
-        self.cache = None; self.cache_time = 0
+        self.cache = None; self.cache_time = 0; self.retry_after = 0
+        self._load_disk()
+    def _disk_path(self):
+        return CACHE_DIR / "aqi_data.json"
+    def _load_disk(self):
+        try:
+            p = self._disk_path()
+            if p.exists():
+                d = json.loads(p.read_text())
+                self.cache = d.get("data")
+                self.cache_time = d.get("time", 0)
+                print("AQI: loaded from disk cache")
+        except Exception: pass
+    def _save_disk(self):
+        try:
+            self._disk_path().write_text(json.dumps({"data": self.cache, "time": self.cache_time}))
+        except Exception: pass
     def fetch(self):
-        if self.cache and time.time() - self.cache_time < WEATHER_POLL_INTERVAL:
+        now = time.time()
+        if self.cache and now - self.cache_time < WEATHER_POLL_INTERVAL:
+            return self.cache
+        if now < self.retry_after:
             return self.cache
         try:
             url = ("https://air-quality-api.open-meteo.com/v1/air-quality?latitude="+
                    str(CHATTANOOGA_LAT)+"&longitude="+str(CHATTANOOGA_LON)+
                    "&current=us_aqi,pm2_5,pm10")
-            r = requests.get(url, timeout=5); r.raise_for_status()
+            r = _session.get(url, timeout=5); r.raise_for_status()
             cur = r.json().get("current",{})
             self.cache = {"aqi":cur.get("us_aqi"),"pm25":cur.get("pm2_5"),"pm10":cur.get("pm10")}
             self.cache_time = time.time()
+            self.retry_after = 0
+            self._save_disk()
             print("AQI: "+str(self.cache["aqi"]))
             return self.cache
         except Exception as e:
-            print("AQI error: "+str(e)); return self.cache
+            print("AQI error: "+str(e))
+            self.retry_after = time.time() + 120  # wait 2 min before retry
+            return self.cache
 
 class SunClient:
     def __init__(self):
         self.cache = None; self.cache_date = None
-    def fetch(self):
+        self._load_disk()
+    def _disk_path(self):
+        return CACHE_DIR / "sun_data.json"
+    def _load_disk(self):
         try:
-            today = datetime.now(ZoneInfo(LOCATION_TZ)).date()
-            if self.cache and self.cache_date == today: return self.cache
+            p = self._disk_path()
+            if p.exists():
+                d = json.loads(p.read_text())
+                sr = d.get("sunrise"); ss = d.get("sunset"); dt = d.get("date")
+                if sr and ss and dt:
+                    self.cache = {"sunrise": datetime.fromisoformat(sr),
+                                  "sunset":  datetime.fromisoformat(ss)}
+                    self.cache_date = datetime.fromisoformat(dt).date()
+                    print("Sun: loaded from disk cache")
+        except Exception: pass
+    def _save_disk(self):
+        try:
+            self._disk_path().write_text(json.dumps({
+                "sunrise": self.cache["sunrise"].isoformat(),
+                "sunset":  self.cache["sunset"].isoformat(),
+                "date":    self.cache_date.isoformat(),
+            }))
+        except Exception: pass
+    def fetch(self):
+        today = datetime.now(ZoneInfo(LOCATION_TZ)).date()
+        if self.cache and self.cache_date == today: return self.cache
+        # ── Primary: open-meteo ──────────────────────────────────────────
+        try:
             url = ("https://api.open-meteo.com/v1/forecast?latitude="+str(CHATTANOOGA_LAT)+
                    "&longitude="+str(CHATTANOOGA_LON)+
                    "&daily=sunrise,sunset&timezone="+LOCATION_TZ+"&forecast_days=1")
-            r = requests.get(url, timeout=5); r.raise_for_status()
+            r = _session.get(url, timeout=5); r.raise_for_status()
+            if r.json().get("error"): raise Exception(r.json().get("reason","open-meteo error"))
             d = r.json().get("daily",{})
             srs = d.get("sunrise") or []; sss = d.get("sunset") or []
-            if not srs or not sss: return self.cache
+            if not srs or not sss: raise Exception("empty sunrise/sunset")
             sr = datetime.fromisoformat(srs[0]); ss = datetime.fromisoformat(sss[0])
             self.cache = {"sunrise":sr,"sunset":ss}
             self.cache_date = today
-            print("Sun: "+sr.strftime("%H:%M")+" - "+ss.strftime("%H:%M"))
+            self._save_disk()
+            print("Sun (open-meteo): "+sr.strftime("%H:%M")+" - "+ss.strftime("%H:%M"))
             return self.cache
         except Exception as e:
-            print("Sun error: "+str(e)); return self.cache
+            print("Sun open-meteo error: "+str(e))
+        # ── Fallback: wttr.in ────────────────────────────────────────────
+        try:
+            r = _session.get(
+                "https://wttr.in/"+LOCATION_NAME.replace(" ","+")+"?format=j1",
+                timeout=8)
+            r.raise_for_status()
+            astro = r.json()["weather"][0]["astronomy"][0]
+            tz = ZoneInfo(LOCATION_TZ)
+            def _parse_wttr_time(s):
+                # e.g. "06:27 AM" or "8:52 PM"
+                return datetime.strptime(s.strip(), "%I:%M %p").replace(
+                    year=today.year, month=today.month, day=today.day,
+                    tzinfo=tz)
+            sr = _parse_wttr_time(astro["sunrise"])
+            ss = _parse_wttr_time(astro["sunset"])
+            self.cache = {"sunrise":sr,"sunset":ss}
+            self.cache_date = today
+            self._save_disk()
+            print("Sun (wttr.in): "+sr.strftime("%H:%M")+" - "+ss.strftime("%H:%M"))
+            return self.cache
+        except Exception as e:
+            print("Sun wttr.in error: "+str(e))
+            return self.cache
 
 # ========== ISS ==========
 class ISSTracker:
@@ -722,7 +958,7 @@ class ISSTracker:
         self.last_poll_time = 0
     def poll(self):
         try:
-            r = requests.get("http://api.open-notify.org/iss-now.json", timeout=5)
+            r = _session.get("http://api.open-notify.org/iss-now.json", timeout=5)
             r.raise_for_status()
             pos = r.json().get("iss_position",{})
             self.lat = float(pos.get("latitude")); self.lon = float(pos.get("longitude"))
@@ -741,17 +977,39 @@ class ISSTracker:
 
 # ========== FLIGHTS ==========
 class FlightTracker:
+    """
+    Polls 3 ADS-B APIs (adsb.lol, airplanes.live, adsb.fi) in background thread.
+    - Rotates between APIs so no single API is hammered
+    - Tries up to 3 times if one API fails
+    - Caches route info (origin/dest) to avoid repeated API calls
+    - Removes stale aircraft after 90 seconds of no updates
+    - Thread-safe with lock for position updates
+    """
     def __init__(self):
-        self.route_cache = {}; self.positions = {}
-        self.lock = threading.Lock(); self.api_index = 0
-        self._route_pending = set()  # callsigns currently being fetched
+        self.route_cache = {}           # Cached flight routes: {callsign: {origin, dest, airline_name}}
+        self.positions = {}             # Current aircraft: {callsign: {lat, lon, altitude, speed, heading, ...}}
+        self.lock = threading.Lock()    # Protects positions dict from race conditions
+        self.api_index = 0              # Which API to try first (rotates)
+        self._route_pending = set()     # Callsigns currently being fetched in background
+                                        # NOTE: accessed from main + route threads without a lock.
+                                        # The GIL makes individual add/discard atomic, so the
+                                        # worst case of a check-then-add race is a duplicate
+                                        # route fetch (harmless — result is idempotent).
+
     def poll_in_background(self):
+        """
+        Non-blocking: runs in daemon thread via start_poll().
+        Queries ADS-B APIs in rotation, parses results, caches, cleans stale data.
+        """
         apis = [self._poll_adsblol, self._poll_airplaneslive, self._poll_adsbfi]
-        planes = []; tries = 0
+        planes = []
+        tries = 0
+        # Try APIs in rotation until we get results or exhaust all 3
         while not planes and tries < len(apis):
             idx = (self.api_index + tries) % len(apis)
             planes = apis[idx]()
             tries += 1
+        # Rotate which API we try first next time (load balance)
         self.api_index = (self.api_index + 1) % len(apis)
         now = time.time()
         with self.lock:
@@ -766,23 +1024,27 @@ class FlightTracker:
             for k in stale: del self.positions[k]
     def _poll_adsblol(self):
         try:
-            r = requests.get("https://api.adsb.lol/v2/lat/"+str(CHATTANOOGA_LAT)+"/lon/"+str(CHATTANOOGA_LON)+"/dist/25", timeout=8)
+            r = _session.get("https://api.adsb.lol/v2/lat/"+str(CHATTANOOGA_LAT)+"/lon/"+str(CHATTANOOGA_LON)+"/dist/25", timeout=8)
             r.raise_for_status()
             return self._parse(r.json().get("ac") or [])
         except Exception as e:
             print("adsb.lol err: "+str(e)); return []
     def _poll_airplaneslive(self):
         try:
-            r = requests.get("https://api.airplanes.live/v2/point/"+str(CHATTANOOGA_LAT)+"/"+str(CHATTANOOGA_LON)+"/25", timeout=8)
+            r = _session.get("https://api.airplanes.live/v2/point/"+str(CHATTANOOGA_LAT)+"/"+str(CHATTANOOGA_LON)+"/25", timeout=8)
             r.raise_for_status()
             return self._parse(r.json().get("ac") or [])
         except Exception as e:
             print("airplanes.live err: "+str(e)); return []
     def _poll_adsbfi(self):
+        # adsb.fi retired api.adsb.fi/v2/... (now 404) and moved to
+        # opendata.adsb.fi, which returns the aircraft list under "aircraft"
+        # instead of "ac" (the per-aircraft fields are otherwise identical).
         try:
-            r = requests.get("https://api.adsb.fi/v2/lat/"+str(CHATTANOOGA_LAT)+"/lon/"+str(CHATTANOOGA_LON)+"/dist/25", timeout=8)
+            r = _session.get("https://opendata.adsb.fi/api/v2/lat/"+str(CHATTANOOGA_LAT)+"/lon/"+str(CHATTANOOGA_LON)+"/dist/25", timeout=8)
             r.raise_for_status()
-            return self._parse(r.json().get("ac") or [])
+            data = r.json()
+            return self._parse(data.get("aircraft") or data.get("ac") or [])
         except Exception as e:
             print("adsb.fi err: "+str(e)); return []
     def _parse(self, ac_list):
@@ -818,10 +1080,15 @@ class FlightTracker:
             for cs, d in self.positions.items():
                 dt = now - d["timestamp"]
                 if dt > 90: continue
-                spd = (d["speed_mph"]/3600)/69.0
-                hr = math.radians(d["heading"])
+                # Dead-reckon the position forward from the last fix so the card
+                # shows a smooth, up-to-date distance between polls.
+                #   1° latitude  ≈ 69 miles everywhere
+                #   1° longitude ≈ 69·cos(latitude) miles (meridians converge)
+                spd = (d["speed_mph"]/3600)/69.0          # degrees of latitude per second
+                hr  = math.radians(d["heading"])
+                coslat = math.cos(math.radians(d["lat"])) or 1e-6   # guard against /0 at the poles
                 nlat = d["lat"] + spd*dt*math.cos(hr)
-                nlon = d["lon"] + spd*dt*math.sin(hr)
+                nlon = d["lon"] + spd*dt*math.sin(hr)/coslat
                 nd = haversine_miles(CHATTANOOGA_LAT, CHATTANOOGA_LON, nlat, nlon)
                 if nd <= RADIUS_MILES:
                     result.append({"callsign":cs,"lat":nlat,"lon":nlon,
@@ -841,7 +1108,7 @@ class FlightTracker:
                   "expiry":time.time()+3600}
         # ── Primary: adsbdb.com ──────────────────────────────────────────
         try:
-            r = requests.get("https://api.adsbdb.com/v0/callsign/"+callsign, timeout=3)
+            r = _session.get("https://api.adsbdb.com/v0/callsign/"+callsign, timeout=3)
             if r.status_code == 200:
                 route = r.json().get("response",{}).get("flightroute",{})
                 org = route.get("origin") or {}
@@ -864,7 +1131,7 @@ class FlightTracker:
         # ── Fallback: OpenSky Network routes (catches charters, medevac, military) ──
         if not result["origin"] and not result["dest"]:
             try:
-                r2 = requests.get("https://opensky-network.org/api/routes",
+                r2 = _session.get("https://opensky-network.org/api/routes",
                                   params={"callsign": callsign}, timeout=4)
                 if r2.status_code == 200:
                     data = r2.json()
@@ -878,12 +1145,15 @@ class FlightTracker:
                 print("opensky route err: "+str(e))
         self.route_cache[callsign] = result
         self._route_pending.discard(callsign)
-        # Prune cache when it gets large — remove expired entries first
+        # Prune cache when it gets large — remove expired entries first.
+        # Snapshot items() first: several route threads + the main loop touch
+        # route_cache concurrently, so iterating it live can raise
+        # "dictionary changed size during iteration".
         if len(self.route_cache) > 400:
             _now = time.time()
-            expired = [k for k, v in self.route_cache.items() if _now > v.get("expiry", 0)]
+            expired = [k for k, v in list(self.route_cache.items()) if _now > v.get("expiry", 0)]
             for k in expired[:200]:
-                del self.route_cache[k]
+                self.route_cache.pop(k, None)   # pop() tolerates a key another thread already removed
         # Pre-warm airline logo cache so render_flight_image never blocks
         ai   = result.get("airline_icao") or (callsign[:3].upper() if len(callsign) >= 3 and callsign[:3].isalpha() else None)
         iata = result.get("airline_iata")
@@ -896,12 +1166,13 @@ class FlightTracker:
         for url in [
             "https://api.adsb.lol/v2/callsign/"+callsign,
             "https://api.airplanes.live/v2/callsign/"+callsign,
-            "https://api.adsb.fi/v2/callsign/"+callsign,
+            "https://opendata.adsb.fi/api/v2/callsign/"+callsign,   # moved from api.adsb.fi
         ]:
             try:
-                r = requests.get(url, timeout=5)
+                r = _session.get(url, timeout=5)
                 if r.status_code != 200: continue
-                ac_list = r.json().get("ac") or []
+                data = r.json()
+                ac_list = data.get("ac") or data.get("aircraft") or []  # opendata.adsb.fi uses "aircraft"
                 if not ac_list: continue
                 ac = ac_list[0]
                 lat = ac.get("lat"); lon = ac.get("lon")
@@ -1028,13 +1299,13 @@ def render_clock():
     lf = get_font(7); tf = get_font(9); sf = get_font(7)
     for i,(label,tz,color) in enumerate(CLOCK_TIMEZONES):
         col = i%2; row = i//2
-        x = col*32; y = row*32
+        x = col*32 + 1; y = row*32
         try:
             dt = datetime.now(ZoneInfo(tz))
             h12 = dt.hour%12 or 12
             ts = str(h12)+":"+("%02d"%dt.minute)
             ss = ":"+("%02d"%dt.second)
-        except: ts = "?"; ss = ""
+        except Exception: ts = "?"; ss = ""
         bbox = draw.textbbox((0,0),label,font=lf); w = bbox[2]-bbox[0]
         draw.text((x+(32-w)//2, y+1), label, font=lf, fill=color)
         bbox = draw.textbbox((0,0),ts,font=tf); w = bbox[2]-bbox[0]
@@ -1080,7 +1351,7 @@ def render_weather(weather, aqi_data=None, frame=0):
         bbox = draw.textbbox((0,0),lbl,font=tiny); w = bbox[2]-bbox[0]
         c = (255,255,80) if i==0 else (160,195,255)
         draw.text((cx-w//2, 22), lbl, font=tiny, fill=c)
-        draw_small_weather_icon(draw, cx, 37, day.get("code"), frame)
+        draw_small_weather_icon(draw, cx, 39, day.get("code"), frame)
         hi = day.get("high")
         if hi is not None:
             ht = str(int(round(hi)))+chr(176)
@@ -1114,7 +1385,7 @@ def render_sun(sun_data, weather=None):
 
     def _fmt(dt):
         try: return str(dt.hour % 12 or 12) + ":" + ("%02d" % dt.minute)
-        except: return "--:--"
+        except Exception: return "--:--"
 
     # Compute peak UV
     peak_uv = None; peak_hour = 0
@@ -1184,16 +1455,16 @@ def render_sun(sun_data, weather=None):
                     draw.line([(x, y_top+1), (x, GY1)], fill=dim)
             draw.line([(x1,y1),(x2,y2)], fill=col, width=1)
 
-        # Peak dot (colored)
+        # Peak dot (colored) — 4×4 bounding box for a slightly chunky dot
         if peak_uv is not None:
             px, py = pts[peak_hour]
-            draw.ellipse([(px-2,py-2),(px+2,py+2)], fill=_uv_col(peak_uv))
+            draw.ellipse([(px-1,py-1),(px+2,py+2)], fill=_uv_col(peak_uv))
 
         # "Now" marker  — vertical dim line + white dot
         if 0 <= now_hour <= 23:
             nx, ny = pts[now_hour]
             draw.line([(nx, GY0), (nx, GY1)], fill=(48, 48, 68))
-            draw.ellipse([(nx-2,ny-2),(nx+2,ny+2)], fill=(255,255,255))
+            draw.ellipse([(nx-1,ny-1),(nx+2,ny+2)], fill=(255,255,255))
     else:
         draw.text((32, 30), "loading...", font=get_font(6), fill=(55,55,75), anchor="mm")
 
@@ -1269,53 +1540,50 @@ def render_iss(iss):
     for _ in range(28):
         sx = star_positions.randint(0, 63)
         sy = star_positions.randint(0, 63)
-        # flicker: each star independently on/off based on hash of pos+tick
         flicker_seed = (sx * 97 + sy * 31 + tick) % 7
-        if flicker_seed < 5:  # 5/7 chance visible each frame
+        if flicker_seed < 5:
             sb = rg.randint(120, 255)
             draw.point((sx, sy), fill=(sb, sb, min(sb + 20, 255)))
 
-    # ISS label
-    draw.text((32, 5), "ISS", font=get_font(9), fill=(120, 230, 255), anchor="mm")
-    draw.text((32, 13), "OVERHEAD", font=get_font(7), fill=(255, 215, 70), anchor="mm")
+    # ── Header (y=0–12) ──────────────────────────────────────────────────
+    draw.text((32, 4),  "ISS",      font=get_font(8), fill=(100, 220, 255), anchor="mm")
+    draw.text((32, 12), "OVERHEAD", font=get_font(6), fill=(255, 200, 80),  anchor="mm")
 
-    # ── ISS silhouette — compact, centered at (32, 24) ──────────────────
+    # ── ISS silhouette — centered at (32, 24) ────────────────────────────
     cx, cy = 32, 24
     truss_col  = (170, 175, 180)
     panel_col  = (45, 85, 185)
     cell_col   = (22, 45, 105)
     module_col = (200, 205, 210)
 
-    # Main truss: thin 1-px backbone
     draw.line([(cx - 16, cy), (cx + 16, cy)], fill=truss_col, width=2)
 
-    # Solar arrays: 2 pairs per side, each 5 px wide × 10 px tall
-    # Inner pair at ±5 from center, outer at ±13
     for side in (-1, 1):
         for offset in (5, 13):
             px = cx + side * offset
             x0, x1 = px - 2, px + 2
-            y0, y1 = cy - 6, cy + 6
+            y0, y1 = cy - 5, cy + 5
             draw.rectangle([(x0, y0), (x1, y1)], fill=panel_col)
-            # Cell dividers
             for gy in range(y0 + 3, y1, 3):
                 draw.line([(x0, gy), (x1, gy)], fill=cell_col)
 
-    # Central habitation module — compact silver box
     draw.rectangle([(cx - 3, cy - 3), (cx + 3, cy + 3)], fill=module_col)
-    draw.line([(cx - 3, cy), (cx + 3, cy)], fill=(150, 155, 160))  # equator seam
+    draw.line([(cx - 3, cy), (cx + 3, cy)], fill=(150, 155, 160))
 
-    # Small nadir/zenith radiators (perpendicular to truss)
-    draw.rectangle([(cx - 1, cy - 7), (cx + 1, cy - 4)], fill=(220, 225, 230))
-    draw.rectangle([(cx - 1, cy + 4), (cx + 1, cy + 7)], fill=(220, 225, 230))
+    draw.rectangle([(cx - 1, cy - 6), (cx + 1, cy - 4)], fill=(220, 225, 230))
+    draw.rectangle([(cx - 1, cy + 4), (cx + 1, cy + 6)], fill=(220, 225, 230))
 
-    # ── Info — three lines stacked below sprite (sprite bottom = cy+7 = 31) ──
+    # ── Divider ──────────────────────────────────────────────────────────
+    draw.line([(6, 34), (57, 34)], fill=(35, 35, 60))
+
+    # ── Info — three centred lines, all anchor="mm" ──────────────────────
+    #   font7 ≈8px tall, font6 ≈6px tall. Lines at y=43/52/60:
+    #   dist  43 → spans 39-47 | speed 52 → 49-55 | alt 60 → 57-63
     if iss and iss.distance is not None:
         dist_str = f"{int(iss.distance):,} mi away"
-        bbox = draw.textbbox((0, 0), dist_str, font=get_font(7))
-        draw.text(((64 - (bbox[2]-bbox[0])) // 2, 33), dist_str, font=get_font(7), fill=(255, 255, 255))
-    draw.text((32, 44), "17,500 mph", font=get_font(7), fill=(160, 210, 255), anchor="mm")
-    draw.text((32, 54), "~250 mi up", font=get_font(7), fill=(140, 190, 255), anchor="mm")
+        draw.text((32, 43), dist_str, font=get_font(7), fill=(255, 255, 255), anchor="mm")
+    draw.text((32, 52), "17,500 mph", font=get_font(6), fill=(120, 180, 255), anchor="mm")
+    draw.text((32, 60), "~250 mi up", font=get_font(6), fill=(100, 140, 220), anchor="mm")
     return img
 
 def render_flight_image(plane, route):
@@ -1343,7 +1611,7 @@ def render_flight_image(plane, route):
             bg.paste(logo, ((28-logo.width)//2, (28-logo.height)//2), logo)
             img.paste(bg, (0,0))
             drawn = True
-        except: pass
+        except Exception: pass  # bad logo image — fall through to text/silhouette fallback
     if not drawn:
         if not is_heli and ai and ai in AIRLINE_BRANDS:
             text,fg,bgc = AIRLINE_BRANDS[ai]
@@ -1374,7 +1642,7 @@ def render_flight_image(plane, route):
                         draw.text(((28-w)//2-bbox[0],(28-h)//2-bbox[1]),icon_char,font=ef,fill=icon_color)
                         rendered = True
                         break
-                    except: pass
+                    except Exception: pass  # font doesn't support this glyph — try next
             if not rendered:
                 if is_heli:
                     # Pixel-art helicopter silhouette
@@ -1562,7 +1830,7 @@ def render_dual_music(sp_music, sp_art_path, hp_music, hp_art_path):
             art = art.resize((nw, nh), Image.Resampling.LANCZOS)
             left = (nw - 32) // 2; top = (nh - 32) // 2
             return art.crop((left, top, left + 32, top + 32))
-        except: return None
+        except Exception: return None  # corrupt image file — show placeholder instead
 
     # Album arts
     sp_art = _fill_32(sp_art_path)
@@ -1648,6 +1916,7 @@ def count_photos():
 # ========== DISPLAY ==========
 _display_proc = None
 _last_raw_img = None
+_display_lock = threading.Lock()  # Prevents concurrent writes to display (avoids flicker)
 
 def get_display_proc():
     global _display_proc
@@ -1657,12 +1926,14 @@ def get_display_proc():
     return _display_proc
 
 def _send_raw(img):
-    buf = BytesIO(); img.save(buf,"PPM")
-    try:
-        proc = get_display_proc()
-        proc.stdin.write(buf.getvalue()); proc.stdin.flush()
-    except Exception as e:
-        print("Display pipe error: "+str(e))
+    """Send image to display driver via PPM pipe. Thread-safe with lock."""
+    with _display_lock:  # Prevent concurrent writes that cause flicker
+        buf = BytesIO(); img.save(buf,"PPM")
+        try:
+            proc = get_display_proc()
+            proc.stdin.write(buf.getvalue()); proc.stdin.flush()
+        except Exception as e:
+            print("Display pipe error: "+str(e))
 
 def display_pil_image(img, photo=False):
     global _last_raw_img
@@ -1672,31 +1943,414 @@ def display_pil_image(img, photo=False):
         img.thumbnail((MATRIX_WIDTH,MATRIX_HEIGHT), Image.Resampling.LANCZOS)
         canvas.paste(img, ((MATRIX_WIDTH-img.width)//2, (MATRIX_HEIGHT-img.height)//2))
         img = canvas
-    if not photo and get_brightness() <= 50:
+    # get_brightness() returns a float in [0.0, 1.0].  At low brightness (≤ 0.5,
+    # i.e. the 35% or lower schedule segments) very-dark pixels look muddy rather
+    # than black on the LED panel, so we crush them to true black here.
+    # Bug-fix: the original threshold was 50, which is always true for any valid
+    # brightness (max 1.0 ≤ 50), meaning crushing was applied at ALL brightness
+    # levels including 100%.  Correct threshold is 0.5 (= 50%).
+    if not photo and get_brightness() <= 0.5:
         img = img.point(lambda p: p if p > 22 else 0)
     _last_raw_img = img.copy()
     _send_raw(apply_dimming(img))
 
-def do_transition():
-    """Crossfade: old slide fades to transparent, new black fades to opaque."""
+def do_transition(next_img=None):
+    """Smooth fade: current slide → next slide (or black if next_img is None).
+    16 frames at 30ms = ~0.5s total. Uses smoothstep for a gentle ease in/out."""
     global _last_raw_img
     if _last_raw_img is None: return
-    b = get_brightness()
-    black = Image.new("RGB", (MATRIX_WIDTH, MATRIX_HEIGHT), (0, 0, 0))
-    # Smooth 6-frame crossfade
-    for i in range(7):
-        blend = i / 6.0  # 0→1
-        img = Image.blend(_last_raw_img, black, blend)
+    b    = get_brightness()
+    src  = _last_raw_img.copy()
+    dst  = next_img if next_img is not None else Image.new("RGB", (MATRIX_WIDTH, MATRIX_HEIGHT), (0, 0, 0))
+    if dst.size != src.size: dst = dst.resize(src.size)
+    for i in range(1, 17):
+        t   = i / 16.0
+        t   = t * t * (3.0 - 2.0 * t)   # smoothstep
+        img = Image.blend(src, dst, t)
         _send_raw(ImageEnhance.Brightness(img).enhance(b))
-        time.sleep(0.025)
+        time.sleep(0.030)
 
-def do_plane_transition_async(flight_img):
-    """Non-blocking wrapper: spawn plane transition in background thread."""
-    threading.Thread(target=do_plane_transition, args=(flight_img,), daemon=True).start()
+def do_globe_intro(reveal_img, flights_tracker=None, city_name=None):
+    """Startup animation — real satellite texture, seamless Google-Earth-style zoom.
+
+    Phases:
+      1. Real satellite texture projected onto a spinning globe (one full
+         rotation, ease-out, landing with the configured location facing viewer)
+      2. Smooth zoom into the location — world texture crops tighter each frame
+      3. Satellite tile of the exact area (fetched from ESRI World Imagery CDN,
+         cached after first download) with slow green strobe on the pinpoint
+
+    Projection used for the spin:
+      Orthographic — viewed straight down the Z axis.
+      For each screen pixel (px, py) inside the globe circle:
+        u = (px - gcx) / r          # x normalised to [-1, 1]
+        v = (gcy - py) / r          # y normalised (up = positive)
+        z = sqrt(1 - u² - v²)       # depth (front hemisphere only)
+      After rotating the globe by angle θ around the Y axis:
+        X = u·cos θ + z·sin θ
+        lon = atan2(X, z_rot)        → sample equirectangular texture
+        lat = arcsin(v)
+      Uses numpy for vectorised per-pixel calculation (~64×64 pixels,
+      very fast on Pi 4).
+
+    Fallback: if texture download fails and no cache exists, the function
+    silently skips the animation (no crash, no hang).
+    """
+    import numpy as np
+
+    brt = get_brightness()
+    W, H   = MATRIX_WIDTH, MATRIX_HEIGHT
+    cx, cy = W // 2, H // 2
+    R      = 28           # globe radius in pixels
+
+    LAT = math.radians(CHATTANOOGA_LAT)
+    LON = math.radians(CHATTANOOGA_LON)
+
+    # ── Coordinate grids — computed once, reused every frame ─────────────
+    px_arr = np.arange(W, dtype=np.float32)
+    py_arr = np.arange(H, dtype=np.float32)
+    PX, PY = np.meshgrid(px_arr, py_arr)   # both shape (H, W)
+
+    # ── Load / download Earth satellite texture ───────────────────────────
+    TEXTURE_CACHE = CACHE_DIR / "earth_texture.jpg"
+    TEXTURE_URLS  = [
+        # NASA Blue Marble (2048×1024, equirectangular, public domain)
+        "https://eoimages.gsfc.nasa.gov/images/imagerecords/57000/57752/land_shallow_topo_2048.jpg",
+        # Wikimedia fallback (same projection, reliable CDN)
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/c/cd/Land_ocean_ice_cloud_hires.jpg/1024px-Land_ocean_ice_cloud_hires.jpg",
+    ]
+
+    texture = None
+    if TEXTURE_CACHE.exists():
+        try:
+            texture = Image.open(TEXTURE_CACHE).convert("RGB")
+        except Exception:
+            pass
+
+    if texture is None:
+        print("[Globe] Downloading Earth texture (first run, cached afterwards)…")
+        for url in TEXTURE_URLS:
+            try:
+                resp = _session.get(url, timeout=15)
+                if resp.status_code == 200:
+                    raw = Image.open(BytesIO(resp.content)).convert("RGB")
+                    # Resize to 540×270 — enough detail for 64px globe, fast to process
+                    raw = raw.resize((540, 270), Image.LANCZOS)
+                    raw.save(TEXTURE_CACHE, "JPEG", quality=92)
+                    texture = raw
+                    print("[Globe] Texture downloaded and cached.")
+                    break
+            except Exception as e:
+                print(f"[Globe] Texture source failed: {e}")
+
+    if texture is None:
+        print("[Globe] No texture available — skipping intro animation.")
+        return
+
+    TW, TH   = texture.size                        # 540 × 270
+    tex_arr  = np.array(texture, dtype=np.uint8)   # shape (TH, TW, 3)
+
+    # ── Satellite close-up tile (ESRI World Imagery, cached) ─────────────
+    # We fetch one 256×256 tile at zoom=10 centred on the configured location.
+    # The tile URL scheme is standard XYZ/TMS.
+    TILE_CACHE = CACHE_DIR / "location_tile.jpg"
+
+    def _deg2tile(lat_deg, lon_deg, zoom):
+        """Convert geographic coordinates to XYZ tile indices."""
+        n   = 2 ** zoom
+        x   = int((lon_deg + 180.0) / 360.0 * n)
+        lat_r = math.radians(lat_deg)
+        y   = int((1.0 - math.log(math.tan(lat_r) + 1.0 / math.cos(lat_r)) / math.pi) / 2.0 * n)
+        return x, y
+
+    location_tile = None
+    if TILE_CACHE.exists():
+        try:
+            location_tile = Image.open(TILE_CACHE).convert("RGB")
+        except Exception:
+            pass
+
+    if location_tile is None:
+        try:
+            zoom    = 10
+            tx, ty  = _deg2tile(CHATTANOOGA_LAT, CHATTANOOGA_LON, zoom)
+            tile_url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{ty}/{tx}"
+            resp = _session.get(tile_url, timeout=8)
+            if resp.status_code == 200:
+                location_tile = Image.open(BytesIO(resp.content)).convert("RGB")
+                location_tile.save(TILE_CACHE, "JPEG", quality=92)
+                print("[Globe] Location satellite tile cached.")
+        except Exception as e:
+            print(f"[Globe] Location tile fetch failed: {e}")
+
+    # ── Star field — fixed random positions so they don't flicker ────────
+    # Generate once, reuse every frame. Each star is (x, y, brightness).
+    _rng   = random.Random(42)   # fixed seed = same stars every boot
+    _stars = [
+        (_rng.randint(0, W-1), _rng.randint(0, H-1),
+         _rng.randint(60, 200))
+        for _ in range(60)
+    ]
+
+    # ── Core rendering function (numpy orthographic projection) ───────────
+    def _render_textured_globe(rot_angle, gcx_f=float(cx), gcy_f=float(cy), radius=float(R)):
+        """
+        Project the Earth texture onto the globe at the given rotation angle.
+        Each screen pixel inside the circle is back-projected to a lat/lon,
+        then sampled from the equirectangular satellite texture.
+        Pixels outside the circle stay black (space).
+        """
+        r = max(1.0, radius)
+
+        # Normalised globe coordinates for every screen pixel
+        U = (PX - gcx_f) / r   # shape (H, W)
+        V = (gcy_f - PY) / r
+
+        dist2 = U * U + V * V
+        mask  = dist2 <= 1.0   # True for pixels inside the globe
+
+        # Depth on the front hemisphere (Z > 0 = facing viewer)
+        Z = np.where(mask, np.sqrt(np.maximum(0.0, 1.0 - dist2)), 0.0)
+
+        # Rotate around Y axis by rot_angle
+        cos_a = math.cos(rot_angle)
+        sin_a = math.sin(rot_angle)
+        X_rot =  U * cos_a + Z * sin_a
+        Z_rot = -U * sin_a + Z * cos_a
+
+        # Geographic coordinates (radians)
+        lat_map = np.arcsin(np.clip(V, -1.0, 1.0))
+        lon_map = np.arctan2(X_rot, Z_rot)   # range (-π, π)
+
+        # Map to equirectangular texture pixel indices
+        tex_x = np.mod(
+            ((lon_map / (2.0 * math.pi) + 0.5) * TW).astype(np.int32), TW
+        )
+        tex_y = np.clip(
+            ((0.5 - lat_map / math.pi) * TH).astype(np.int32), 0, TH - 1
+        )
+
+        # Limb darkening: dim pixels near the edge for a 3-D look
+        # Z ranges 0 (limb) → 1 (centre); apply gentle power curve
+        limb = np.where(mask, 0.35 + 0.65 * Z, 0.0)
+
+        result = np.zeros((H, W, 3), dtype=np.float32)
+        idx_y  = tex_y[mask]
+        idx_x  = tex_x[mask]
+        result[mask] = tex_arr[idx_y, idx_x].astype(np.float32)
+
+        # Apply limb darkening per-channel
+        result[:, :, 0] *= limb
+        result[:, :, 1] *= limb
+        result[:, :, 2] *= limb
+
+        # Paint stars in the black space around the globe
+        for sx, sy, sv in _stars:
+            if not mask[sy, sx]:   # only draw outside the globe
+                result[sy, sx] = [sv, sv, sv]
+
+        return Image.fromarray(result.clip(0, 255).astype(np.uint8))
+
+
+
+    # ── Tile utilities ────────────────────────────────────────────────────
+    def _latlon_to_tile(lat, lon, z):
+        """Convert lat/lon to XYZ tile coordinates at the given zoom level."""
+        n     = 2 ** z
+        tx    = int((lon + 180.0) / 360.0 * n)
+        lat_r = math.radians(lat)
+        ty    = int((1.0 - math.log(math.tan(lat_r) + 1.0 / math.cos(lat_r)) / math.pi) / 2.0 * n)
+        return tx, ty
+
+    def _tile_to_latlon(tx, ty, z):
+        """Top-left corner (lat, lon) of a tile."""
+        n   = 2 ** z
+        lon = tx / n * 360.0 - 180.0
+        lat = math.degrees(math.atan(math.sinh(math.pi * (1.0 - 2.0 * ty / n))))
+        return lat, lon
+
+    def _latlon_to_pixel_in_mosaic(lat, lon, lat_top, lon_left, lat_bot, lon_right, mw, mh):
+        """Map a lat/lon to pixel coordinates inside a tile mosaic using Mercator."""
+        def merc(l): return math.log(math.tan(math.pi / 4 + math.radians(l) / 2))
+        px = int((lon - lon_left)  / (lon_right - lon_left)  * mw)
+        py = int((merc(lat_top) - merc(lat)) / (merc(lat_top) - merc(lat_bot)) * mh)
+        return px, py
+
+    def _fetch_mosaic(center_lat, center_lon, zoom, grid=3, cache_path=None, timeout=10):
+        """Download a grid×grid tile mosaic centred on the location; cache to disk."""
+        if cache_path and Path(cache_path).exists():
+            try:
+                return Image.open(cache_path).convert("RGB")
+            except Exception:
+                pass
+        tx_c, ty_c = _latlon_to_tile(center_lat, center_lon, zoom)
+        half   = grid // 2
+        mosaic = Image.new("RGB", (grid * 256, grid * 256), (8, 8, 8))
+        for row in range(grid):
+            for col in range(grid):
+                tx = tx_c - half + col
+                ty = ty_c - half + row
+                url = (f"https://server.arcgisonline.com/ArcGIS/rest/services/"
+                       f"World_Imagery/MapServer/tile/{zoom}/{ty}/{tx}")
+                try:
+                    r = _session.get(url, timeout=timeout)
+                    if r.status_code == 200:
+                        mosaic.paste(Image.open(BytesIO(r.content)).convert("RGB"),
+                                     (col * 256, row * 256))
+                except Exception:
+                    pass
+        if cache_path:
+            try: mosaic.save(cache_path, "JPEG", quality=92)
+            except Exception: pass
+        return mosaic
+
+    def _mosaic_bounds(center_lat, center_lon, zoom, grid=3):
+        """Return (lat_top, lon_left, lat_bot, lon_right) for a tile mosaic."""
+        tx_c, ty_c = _latlon_to_tile(center_lat, center_lon, zoom)
+        half = grid // 2
+        lat_top, lon_left = _tile_to_latlon(tx_c - half,      ty_c - half,      zoom)
+        lat_bot, lon_right = _tile_to_latlon(tx_c + half + 1, ty_c + half + 1,  zoom)
+        return lat_top, lon_left, lat_bot, lon_right
+
+    # ── Prefetch tiles in background during the spin ──────────────────────
+    # Zoom-12: ~3km per tile, 3×3 = ~9km — good city-level view.
+    # Zoom-10: ~20km per tile, 3×3 = ~60km — shows 25-mile plane radius.
+    CITY_ZOOM  = 12
+    PLANE_ZOOM = 10
+    CITY_CACHE  = str(CACHE_DIR / "location_city_z12.jpg")
+    PLANE_CACHE = str(CACHE_DIR / "location_planeview_z10.jpg")
+
+    _city_box  = [None]
+    _plane_box = [None]
+
+    def _fetch_city():
+        try:
+            _city_box[0] = _fetch_mosaic(CHATTANOOGA_LAT, CHATTANOOGA_LON,
+                                          CITY_ZOOM, grid=3, cache_path=CITY_CACHE)
+            print("[Globe] City tiles ready.")
+        except Exception as e:
+            print(f"[Globe] City tiles failed: {e}")
+
+    def _fetch_plane_view():
+        try:
+            _plane_box[0] = _fetch_mosaic(CHATTANOOGA_LAT, CHATTANOOGA_LON,
+                                           PLANE_ZOOM, grid=3, cache_path=PLANE_CACHE)
+            print("[Globe] Plane-view tiles ready.")
+        except Exception as e:
+            print(f"[Globe] Plane-view tiles failed: {e}")
+
+    import threading as _thr
+    _thr.Thread(target=_fetch_city,       daemon=True).start()
+    _thr.Thread(target=_fetch_plane_view, daemon=True).start()
+
+    # ── Phase 1: Spin one full rotation landing at the location ───────────
+    SPIN_FRAMES = 80
+    for i in range(SPIN_FRAMES):
+        t     = i / (SPIN_FRAMES - 1)
+        ease  = 1.0 - (1.0 - t) ** 2
+        angle = LON + 2.0 * math.pi * (1.0 - ease)
+        img   = _render_textured_globe(angle)
+        _send_raw(ImageEnhance.Brightness(img).enhance(brt))
+        time.sleep(0.033)
+
+    # ── Phase 2: Seamless zoom to city level ──────────────────────────────
+    # Scale goes from 1 → 14 (globe radius 28 → 392px on 64px screen).
+    # At scale=14 only a tiny flat patch is visible — seamless like Google Earth.
+    # Crossfades into the zoom-12 city satellite mosaic in the final third.
+    MAX_SCALE   = 14.0
+    ZOOM_FRAMES = 90
+    BLEND_START = 62
+
+    # Prepare city background: centre crop of 3×3 mosaic → 64×64
+    city_bg = None
+    if _city_box[0] is not None:
+        cm  = _city_box[0]
+        cw, ch = cm.size          # 768 × 768
+        margin = cw // 4          # crop inner half — tighter city view
+        city_bg = cm.crop((margin, margin, cw - margin, ch - margin)
+                          ).resize((W, H), Image.LANCZOS)
+
+    last_frame = None
+    for i in range(ZOOM_FRAMES):
+        t     = i / (ZOOM_FRAMES - 1)
+        ease  = t * t * (3.0 - 2.0 * t)
+        scale = 1.0 + (MAX_SCALE - 1.0) * ease
+
+        gcy_z       = cy + R * scale * math.sin(LAT)
+        globe_frame = _render_textured_globe(LON, gcx_f=float(cx),
+                                             gcy_f=gcy_z, radius=R * scale)
+
+        if city_bg is not None and i >= BLEND_START:
+            bt    = (i - BLEND_START) / (ZOOM_FRAMES - BLEND_START)
+            bt    = bt * bt * (3.0 - 2.0 * bt)
+            frame = Image.blend(globe_frame, city_bg, bt)
+        else:
+            frame = globe_frame
+
+        if i >= BLEND_START // 2:
+            d  = ImageDraw.Draw(frame)
+            gv = int(200 * ease)
+            d.ellipse([(cx-1, cy-1), (cx+1, cy+1)], fill=(0, gv, gv//2))
+
+        last_frame = frame
+        _send_raw(ImageEnhance.Brightness(frame).enhance(brt))
+        time.sleep(0.033)
+
+    # ── Phase 3: City view — city name + green strobe ─────────────────────
+    bg = city_bg if city_bg is not None else last_frame
+
+    def _city_frame(pulse):
+        f  = bg.copy()
+        d  = ImageDraw.Draw(f)
+        # Green strobe dot + glow ring
+        glow_r = 2 + int(4 * pulse)
+        glow_v = int(255 * pulse)
+        d.ellipse([(cx-glow_r, cy-glow_r), (cx+glow_r, cy+glow_r)],
+                  outline=(0, glow_v, glow_v // 3))
+        d.ellipse([(cx-1, cy-1), (cx+1, cy+1)], fill=(0, 255, 90))
+        return f
+
+    STROBE_FRAMES = 55
+    for i in range(STROBE_FRAMES):
+        t     = i / STROBE_FRAMES
+        pulse = 0.5 + 0.5 * math.sin(t * 2.0 * math.pi * 2.0)
+        _send_raw(ImageEnhance.Brightness(_city_frame(pulse)).enhance(brt))
+        time.sleep(0.040)
+
+    # ── Slow fade to the first slideshow frame (the clock) ───────────────
+    final_map = _city_frame(0.0)   # clean city frame with no glow
+    FADE_FRAMES = 40
+    for i in range(FADE_FRAMES):
+        t     = i / (FADE_FRAMES - 1)
+        ease  = t * t * (3.0 - 2.0 * t)   # smoothstep — gentle start and end
+        frame = Image.blend(final_map, reveal_img, ease)
+        _send_raw(ImageEnhance.Brightness(frame).enhance(brt))
+        time.sleep(0.040)
+
+
 
 def do_plane_transition(flight_img):
-    """Top-down airliner silhouette sweeps left→right; new slide revealed behind it.
-    NOTE: This blocks for ~2.8s. Call via do_plane_transition_async() to avoid blocking the main loop."""
+    """Animated intro for the flight tracker: a top-down airliner silhouette
+    sweeps left→right across the matrix, wiping the previous slide away and
+    revealing `flight_img` (the flight card) behind its wings.
+
+    ┌──────────────────────────────────────────────────────────────────────┐
+    │ WHY THIS RUNS SYNCHRONOUSLY (blocking ~3.2s) — DO NOT THREAD IT.       │
+    │                                                                        │
+    │ The LED matrix has exactly ONE writer pipe (_send_raw). If this        │
+    │ animation runs in a background thread while the main loop also calls    │
+    │ display_pil_image(), the two alternate frames on the panel and you get  │
+    │ the flicker we chased for hours. Running it inline in the main loop     │
+    │ guarantees a single, ordered stream of frames → perfectly smooth.      │
+    │                                                                        │
+    │ The startup intro (see main()) already calls this synchronously and    │
+    │ looks great; the in-loop plane intro now uses the same path.           │
+    │                                                                        │
+    │ The animation's FINAL frame is exactly `flight_img` (plane has flown    │
+    │ off the right edge, mask fully reveals the card), so the hand-off to    │
+    │ the static flight card afterwards is seamless — no flash, no gap.       │
+    └──────────────────────────────────────────────────────────────────────┘
+    """
     b  = get_brightness()
     W, H = MATRIX_WIDTH, MATRIX_HEIGHT
     mid = H // 2   # 32
@@ -1711,65 +2365,80 @@ def do_plane_transition(flight_img):
         """Screen coordinate relative to nose position."""
         return (nose_x + dx, mid + dy)
 
-    frames = 80
+    frames = 55
     for frame in range(frames):
         t = frame / (frames - 1)
         # Nose to tail = 46px. For tail to clear screen (>= 64), nose must reach >= 110
         nose_x = int(t * (W + plane_len + 46)) - plane_len
 
-        # Wing leading edge: root at (nx-10, mid), tips at (nx-26, 0) and (nx-26, H-1)
-        # Use this chevron as the wipe mask — new slide left, old slide right, plane on top
-        wl_root = nose_x - 10   # x where wing leading edge meets fuselage
-        wl_tip  = nose_x - 26   # x where wing leading edge reaches screen top/bottom
+        # Wing leading edge positions:
+        #   wl_tip  = x where the wing tip (top/bottom edge) crosses the screen
+        #   wl_root = x where the wing root meets the fuselage at mid
+        wl_root = nose_x - 10
+        wl_tip  = nose_x - 26
+
+        tip_x  = max(0, min(wl_tip,  W))
+        root_x = max(0, min(wl_root, W))
+
+        # IMPORTANT: when tip_x == 0 the chevron polygon degenerates to a
+        # vertical line at x=0 and PIL still fills a 1-pixel column — that's
+        # the "nose dot" that appeared before the animation started.
+        # Guard: if the chevron hasn't reached the screen yet, just show the
+        # outgoing slide unchanged (no composite, no plane drawing).
+        if tip_x == 0 and root_x == 0:
+            _send_raw(ImageEnhance.Brightness(from_img).enhance(b))
+            time.sleep(0.040)
+            continue
 
         mask = Image.new("L", (W, H), 0)
         md   = ImageDraw.Draw(mask)
-        # Chevron polygon: left region = new slide
         md.polygon([
-            (0,           0),
-            (max(0, min(wl_tip,  W)), 0),
-            (max(0, min(wl_root, W)), mid),
-            (max(0, min(wl_tip,  W)), H - 1),
-            (0,           H - 1),
+            (0,      0),
+            (tip_x,  0),
+            (root_x, mid),
+            (tip_x,  H - 1),
+            (0,      H - 1),
         ], fill=255)
         img = Image.composite(flight_img, from_img, mask)
 
         d  = ImageDraw.Draw(img)
         nx = nose_x
 
-        # ── Fuselage ─────────────────────────────────────────────────────
-        d.polygon([
-            pt(nx,  0,  0),
-            pt(nx, -3, -3),
-            pt(nx,-41, -3),
-            pt(nx,-44,  0),
-            pt(nx,-41,  3),
-            pt(nx, -3,  3),
-        ], fill=col)
+        # Only draw plane if any part is on screen
+        if nx + 10 >= 0:  # tail is at nx-44, but nose area starts at nx
+            # ── Fuselage ─────────────────────────────────────────────────────
+            d.polygon([
+                pt(nx,  0,  0),
+                pt(nx, -3, -3),
+                pt(nx,-41, -3),
+                pt(nx,-44,  0),
+                pt(nx,-41,  3),
+                pt(nx, -3,  3),
+            ], fill=col)
 
-        # ── Main wings — leading edge IS the wipe boundary ───────────────
-        d.polygon([             # upper wing
-            pt(nx, -10, -3),
-            pt(nx, -26, -mid),
-            pt(nx, -30, -mid),
-            pt(nx, -20, -3),
-        ], fill=col)
-        d.polygon([             # lower wing
-            pt(nx, -10,  3),
-            pt(nx, -26,  mid - 1),
-            pt(nx, -30,  mid - 1),
-            pt(nx, -20,  3),
-        ], fill=col)
+            # ── Main wings — leading edge IS the wipe boundary ───────────────
+            d.polygon([             # upper wing
+                pt(nx, -10, -3),
+                pt(nx, -26, -mid),
+                pt(nx, -30, -mid),
+                pt(nx, -20, -3),
+            ], fill=col)
+            d.polygon([             # lower wing
+                pt(nx, -10,  3),
+                pt(nx, -26,  mid - 1),
+                pt(nx, -30,  mid - 1),
+                pt(nx, -20,  3),
+            ], fill=col)
 
-        # ── Engine nacelles ───────────────────────────────────────────────
-        for ey, ew in [(-10, -7), (-21, -18)]:
-            d.rectangle([pt(nx, -13, ey), pt(nx, -10, ew)], fill=col)
-        for ey, ew in [(7, 10), (18, 21)]:
-            d.rectangle([pt(nx, -13, ey), pt(nx, -10, ew)], fill=col)
+            # ── Engine nacelles ───────────────────────────────────────────────
+            for ey, ew in [(-10, -7), (-21, -18)]:
+                d.rectangle([pt(nx, -13, ey), pt(nx, -10, ew)], fill=col)
+            for ey, ew in [(7, 10), (18, 21)]:
+                d.rectangle([pt(nx, -13, ey), pt(nx, -10, ew)], fill=col)
 
-        # ── Horizontal tail stabilizers ───────────────────────────────────
-        d.polygon([pt(nx,-35,-3), pt(nx,-38,-3), pt(nx,-42,-12), pt(nx,-39,-12)], fill=col)
-        d.polygon([pt(nx,-35, 3), pt(nx,-38, 3), pt(nx,-42, 12), pt(nx,-39, 12)], fill=col)
+            # ── Horizontal tail stabilizers ───────────────────────────────────
+            d.polygon([pt(nx,-35,-3), pt(nx,-38,-3), pt(nx,-42,-12), pt(nx,-39,-12)], fill=col)
+            d.polygon([pt(nx,-35, 3), pt(nx,-38, 3), pt(nx,-42, 12), pt(nx,-39, 12)], fill=col)
 
         _send_raw(ImageEnhance.Brightness(img).enhance(b))
         time.sleep(0.040)
@@ -1794,7 +2463,7 @@ def download_art(image_url, prefix="art"):
     cf = CACHE_DIR / (prefix+"_"+ck+".jpg")
     if cf.exists(): return str(cf)
     try:
-        r = requests.get(image_url, timeout=3); r.raise_for_status()
+        r = _session.get(image_url, timeout=3); r.raise_for_status()
         Image.open(BytesIO(r.content)).save(cf,"JPEG")
         return str(cf)
     except Exception as e:
@@ -1808,7 +2477,7 @@ def _detect_location():
     Uses ip-api.com (free, no key required).
     """
     try:
-        r = requests.get(
+        r = _session.get(
             "http://ip-api.com/json?fields=status,city,regionName,country,lat,lon",
             timeout=6)
         d = r.json()
@@ -1888,6 +2557,36 @@ def draw_qr_screen(url, top_label="SPOTIFY", bot_label="SCAN TO AUTH"):
 
 # ========== MAIN ==========
 def main():
+    """
+    ═══════════════════════════════════════════════════════════════════════════════
+                            MAIN DASHBOARD LOOP
+    ═══════════════════════════════════════════════════════════════════════════════
+
+    PERFORMANCE NOTES:
+    ──────────────────
+    • Main loop runs ~2 frames/sec (0.5s sleep), never blocks on network
+    • All network calls (API polls, image downloads) run in background threads
+    • Uses connection pooling to reuse TCP connections (huge performance win)
+    • Caches: images, weather, flight routes, ISS position to minimize disk I/O
+    • Thread-safe: uses locks for shared data (positions, cache, etc)
+
+    FLOW:
+    ─────
+    1. Load Spotify config, initialize HomePod discovery, create API clients
+    2. Main loop runs continuously:
+       a) Poll background threads for data (non-blocking)
+       b) Check for user overrides from web dashboard
+       c) High-priority interrupts: flights, ISS, music (show immediately)
+       d) Default: cycle through slides (clock → weather → sun → photos)
+       e) Display image, sleep 0.5s, repeat
+    3. All background threads (weather, flights, Spotify, HomePod) run async
+
+    THREAD SAFETY:
+    ──────────────
+    • Locks used for: flight positions, route cache, display state
+    • Threads are daemon so they exit when main process exits
+    • No resource leaks: all connections reused via session pool
+    """
     cf = Path(os.path.expanduser("~/.spotify_display.conf"))
 
     # ── Load config (may not exist on a brand-new install) ──
@@ -1934,6 +2633,7 @@ def main():
         CHATTANOOGA_LAT, CHATTANOOGA_LON, _geo_city = geo
         print(f"Location auto-detected: {_geo_city} ({CHATTANOOGA_LAT:.4f}, {CHATTANOOGA_LON:.4f})")
     else:
+        _geo_city = LOCATION_NAME   # fall back to config value
         print(f"Location: using config ({CHATTANOOGA_LAT:.4f}, {CHATTANOOGA_LON:.4f})")
 
     # ── HomePod / Apple TV: auto-discover via mDNS ──
@@ -1941,12 +2641,15 @@ def main():
     # This requires: (1) pyatv library installed, (2) mDNS working on the network (port 5353 open)
     # If mDNS fails, music detection from HomePod won't work but the rest of the dashboard continues.
     homepod = None
+    homepod_status = "disabled"
     if HAS_PYATV:
         try:
             homepod = HomePodManager()
-            print("HomePod/AppleTV auto-discovery started (mDNS scan in progress…)")
+            print("HomePod/AppleTV auto-discovery started (scanning all devices on network…)")
+            homepod_status = "initializing"
         except Exception as e:
-            print(f"HomePod init failed (mDNS may be blocked on this network): {e}")
+            print(f"HomePod init failed (mDNS may be blocked): {e}")
+            homepod_status = "init_failed"
     else:
         print("pyatv not installed — HomePod detection disabled")
     flights = FlightTracker()
@@ -1966,6 +2669,11 @@ def main():
     last_flight_poll = 0
     last_iss_poll = 0
     _iss_polling = [False]
+    # Weather/AQI/Sun are refreshed off-thread (their fetches can block for
+    # several seconds on the open-meteo→wttr.in fallback path). The box holds
+    # the latest results; the render paths only ever read the cached copies.
+    last_wx_poll = 0
+    _wx_box = [None, None, None, False]   # [weather, aqi, sun, is_polling]
 
     current_spotify = None       # Spotify playing info or None
     current_homepod = None       # HomePod playing info or None
@@ -1981,12 +2689,13 @@ def main():
     last_manual_cs = None
     current_plane_cs = None
     current_plane_show_start = 0
+    _current_plane_image = None     # Cache rendered plane so no re-render flicker
     plane_last_shown = {}
     iss_logged = False
     current_photo_path = None
     cached_weather = None
     cached_aqi = None
-    weather_fetch_time = 0
+    cached_sun = None
     last_slide_lock = None   # track changes so we can reset last_render instantly
     last_forced_photo = None
     last_planes = []
@@ -1996,9 +2705,11 @@ def main():
     # Ensure status file exists and is world-readable for the web server
     try:
         if not os.path.exists(STATUS_FILE):
-            open(STATUS_FILE, "w").write("{}")
+            with open(STATUS_FILE, "w") as _sf:
+                _sf.write("{}")
         os.chmod(STATUS_FILE, 0o666)
-    except: pass
+    except Exception:
+        pass
     photo_count = count_photos()
     print("Dashboard started")
     print("Photos in "+str(PHOTOS_DIR)+": "+str(photo_count))
@@ -2014,7 +2725,7 @@ def main():
         bd.text((cx, cy - 16), "LED",         font=get_font(16), fill=(0, 180, 255),    anchor="mm")
         bd.text((cx, cy -  2), "DASHBOARD",   font=get_font(7),  fill=(60, 80, 120),    anchor="mm")
         bd.text((cx, cy +  9), DASHBOARD_VERSION, font=get_font(6), fill=(30, 50, 80), anchor="mm")
-        bd.text((cx, cy + 22), DASHBOARD_CREDIT,  font=get_font(6), fill=DASHBOARD_CREDIT_COLOR, anchor="mm")
+        # "by" label — the animated signature replaces the static credit text
 
         def _draw_boot_progress(fraction):
             frame = boot.copy()
@@ -2027,15 +2738,112 @@ def main():
 
         _draw_boot_progress(0.0)
 
+        # ── Animated signature: "Kaden" drawn stroke by stroke then a ★ ──
+        # The name is defined as a list of polyline strokes in a small
+        # coordinate space (0–18 wide, 0–10 tall) that gets scaled and
+        # centred in the bottom quarter of the screen.
+        #
+        # Each stroke is a list of (x, y) points; strokes are drawn
+        # sequentially, one segment per frame, to simulate handwriting.
+        # Each letter occupies its own non-overlapping x-band (≈5px wide,
+        # 1px gap) so "Kaden" reads cleanly instead of clumping together:
+        #   K 0-4   a 6-10   d 12-16   e 18-22   n 24-28
+        SIG_STROKES = [
+            # K — vertical bar
+            [(0,0),(0,10)],
+            # K — upper arm
+            [(0,5),(4,0)],
+            # K — lower arm
+            [(0,5),(4,10)],
+            # a — oval body
+            [(9,4),(7,3),(6,5),(7,8),(9,8),(10,6),(9,4)],
+            # a — right stroke down
+            [(10,4),(10,10)],
+            # d — oval body
+            [(15,4),(13,3),(12,5),(13,8),(15,8),(16,6),(15,4)],
+            # d — right tall stroke
+            [(16,0),(16,10)],
+            # e — horizontal bar + curve
+            [(18,5),(22,5),(22,3),(20,2),(18,4),(18,7),(20,9),(22,8)],
+            # n — left stroke + hump + right stroke
+            [(24,10),(24,4),(26,2),(28,3),(28,10)],
+        ]
+
+        # Map stroke coords → screen pixels
+        SIG_X0  = cx - 16      # left edge of signature (28-unit span, centred)
+        SIG_Y0  = cy + 18      # top of signature
+        SIG_SCX = 1.0          # x scale
+        SIG_SCY = 1.0          # y scale
+        SIG_COL = DASHBOARD_CREDIT_COLOR   # same pink as original credit
+
+        def _sig_pt(x, y):
+            return (int(SIG_X0 + x * SIG_SCX), int(SIG_Y0 + y * SIG_SCY))
+
+        # Build full ordered list of (start, end) segments across all strokes
+        _sig_segments = []
+        for stroke in SIG_STROKES:
+            for j in range(len(stroke) - 1):
+                _sig_segments.append((stroke[j], stroke[j+1]))
+
+        # Draw stroke by stroke: each frame adds one segment
+        _drawn = []   # segments already drawn
+        for seg in _sig_segments:
+            _drawn.append(seg)
+            frame = boot.copy()
+            fd    = ImageDraw.Draw(frame)
+            # Re-draw all completed segments
+            for s0, s1 in _drawn:
+                fd.line([_sig_pt(*s0), _sig_pt(*s1)], fill=SIG_COL, width=1)
+            # Progress bar stays at 0 during signature
+            fd.rectangle([(0, MATRIX_HEIGHT-3),(MATRIX_WIDTH-1, MATRIX_HEIGHT-1)], fill=(0,25,60))
+            display_pil_image(frame)
+            time.sleep(0.045)
+
+        # ── Animate the ★ appearing after the name ──────────────────────
+        # Star centred just to the right of the last stroke (n ends at x=28)
+        STAR_CX = _sig_pt(31, 5)[0]
+        STAR_CY = _sig_pt(31, 5)[1]
+        STAR_R  = 3   # outer radius
+
+        def _draw_star(d, scx, scy, r, fill, scale=1.0):
+            """Draw a 5-pointed star centred at (scx, scy) with outer radius r."""
+            pts = []
+            for k in range(10):
+                angle = math.radians(-90 + k * 36)
+                radius = r * scale if k % 2 == 0 else r * scale * 0.45
+                pts.append((scx + radius * math.cos(angle),
+                             scy + radius * math.sin(angle)))
+            d.polygon(pts, fill=fill)
+
+        STAR_COL = (255, 220, 60)   # gold star
+
+        # Star grows from nothing to full size over 12 frames
+        for i in range(13):
+            scale = i / 12.0
+            frame = boot.copy()
+            fd    = ImageDraw.Draw(frame)
+            # Redraw full signature
+            for s0, s1 in _sig_segments:
+                fd.line([_sig_pt(*s0), _sig_pt(*s1)], fill=SIG_COL, width=1)
+            # Grow star
+            if scale > 0:
+                _draw_star(fd, STAR_CX, STAR_CY, STAR_R, STAR_COL, scale)
+            fd.rectangle([(0, MATRIX_HEIGHT-3),(MATRIX_WIDTH-1, MATRIX_HEIGHT-1)], fill=(0,25,60))
+            display_pil_image(frame)
+            time.sleep(0.040)
+
+        # Hold signature + star for a moment, then continue to progress bar
+        time.sleep(0.3)
+
         # Fetch weather + AQI in background threads — bar reflects actual completion
         weather_box = [None]; aqi_box = [None]; done_flags = [False, False]
         def _fetch_weather():
             try: weather_box[0] = weather.fetch()
-            except: pass
+            except Exception: pass  # network error on boot — bar still completes
             done_flags[0] = True
         def _fetch_aqi():
             try: aqi_box[0] = aqi_client.fetch()
-            except: pass
+            except Exception: pass  # network error on boot — bar still completes
             done_flags[1] = True
         threading.Thread(target=_fetch_weather, daemon=True).start()
         threading.Thread(target=_fetch_aqi,     daemon=True).start()
@@ -2063,11 +2871,13 @@ def main():
 
         cached_weather    = weather_box[0]
         cached_aqi        = aqi_box[0]
-        weather_fetch_time = time.time()
+        _wx_box[0]        = cached_weather   # seed the background-refresh box
+        _wx_box[1]        = cached_aqi
 
         try:
             first_slide = render_clock()
-            do_plane_transition(first_slide)
+            do_globe_intro(first_slide, flights_tracker=flights,
+                           city_name=_geo_city.split(",")[0].strip())
         except Exception as e:
             print(f"Startup transition error: {e}")
 
@@ -2093,467 +2903,528 @@ def main():
         # ════════════════════════════════════════════════════════════════════════════════
 
         while True:
-            now = time.time()
+            try:
+                now = time.time()
 
-            # ─────────────────────────────────────────────────────────────────────────
-            # Every 5s, write a status file for the web server to read
-            # This includes current music, flights in range, ISS state, weather, etc.
-            # ─────────────────────────────────────────────────────────────────────────
-            if now - last_status_write >= 5:
-                last_status_write = now
-                _write_status(current_spotify or current_homepod, last_planes, flights, iss, cached_weather)
+                # ─────────────────────────────────────────────────────────────────────────
+                # Every 5s, write a status file for the web server to read
+                # This includes current music, flights in range, ISS state, weather, etc.
+                # ─────────────────────────────────────────────────────────────────────────
+                if now - last_status_write >= 5:
+                    last_status_write = now
+                    _write_status(current_spotify or current_homepod, last_planes, flights, iss, cached_weather)
 
-            # ─────────────────────────────────────────────────────────────────────────
-            # Check for user overrides from the web dashboard
-            # Overrides include: slide lock (force a specific slide), manual callsign search,
-            # forced photo display, brightness override, and disabled slide categories
-            # ─────────────────────────────────────────────────────────────────────────
-            ov = get_override()
-            disabled_slots = set(ov.get("disabled_slides") or [])
-            slide_lock = ov.get("slide_lock")
-            forced_photo = ov.get("forced_photo")
-            if slide_lock != last_slide_lock:
-                last_slide_lock = slide_lock
-                last_render = 0
-                last_clock_tick = 0
-                current_photo_path = None
-                if not slide_lock and forced_photo:
-                    slot_idx = SLOTS.index("photos") if "photos" in SLOTS else slot_idx
-                    slot_start = now
-            if forced_photo != last_forced_photo:
-                last_forced_photo = forced_photo
-                current_photo_path = None
-                last_render = 0
-                if forced_photo and not slide_lock:
-                    slot_idx = SLOTS.index("photos") if "photos" in SLOTS else slot_idx
-                    slot_start = now
-
-            if slide_lock:
-                anim_frame = int(now * 2)
-                cs_slot = slide_lock
-                if slide_lock == "photos" and now - slot_start >= 20:
-                    slot_start = now
+                # ─────────────────────────────────────────────────────────────────────────
+                # Check for user overrides from the web dashboard
+                # Overrides include: slide lock (force a specific slide), manual callsign search,
+                # forced photo display, brightness override, and disabled slide categories
+                # ─────────────────────────────────────────────────────────────────────────
+                ov = get_override()
+                disabled_slots = set(ov.get("disabled_slides") or [])
+                slide_lock = ov.get("slide_lock")
+                forced_photo = ov.get("forced_photo")
+                if slide_lock != last_slide_lock:
+                    last_slide_lock = slide_lock
+                    last_render = 0
+                    last_clock_tick = 0
+                    current_photo_path = None
+                    if not slide_lock and forced_photo:
+                        slot_idx = SLOTS.index("photos") if "photos" in SLOTS else slot_idx
+                        slot_start = now
+                if forced_photo != last_forced_photo:
+                    last_forced_photo = forced_photo
                     current_photo_path = None
                     last_render = 0
+                    if forced_photo and not slide_lock:
+                        slot_idx = SLOTS.index("photos") if "photos" in SLOTS else slot_idx
+                        slot_start = now
+
+                if slide_lock:
+                    anim_frame = int(now * 2)
+                    cs_slot = slide_lock
+                    if slide_lock == "photos" and now - slot_start >= 20:
+                        slot_start = now
+                        current_photo_path = None
+                        last_render = 0
+
+                    if cs_slot == "clock":
+                        if now - last_clock_tick >= CLOCK_REFRESH_INTERVAL:
+                            display_pil_image(render_clock())
+                            last_clock_tick = now; last_render = now
+
+                    elif cs_slot == "weather":
+                        # Data kept fresh by the background _poll_wx thread — just render.
+                        display_pil_image(render_weather(cached_weather, cached_aqi, anim_frame))
+                        last_render = now
+
+                    elif cs_slot == "sun":
+                        if last_render == 0 or now - last_render >= 30:
+                            display_pil_image(render_sun(cached_sun, cached_weather))
+                            last_render = now
+
+                    elif cs_slot == "photos":
+                        if current_photo_path is None:
+                            photo = pick_photo(last_forced_photo)
+                            if photo:
+                                current_photo_path = photo
+                                last_render = 0
+                        if current_photo_path and last_render == 0:
+                            try:
+                                _ps = _load_photo_settings()
+                                _pn = os.path.basename(current_photo_path)
+                                display_pil_image(zoom_to_fill_64(Image.open(current_photo_path), _ps.get(_pn)), photo=True)
+                            except Exception:
+                                current_photo_path = None
+                            last_render = now
+
+                    elif cs_slot == "flights":
+                        # ─────────────────────────────────────────────────────────────────
+                        # FLIGHTS SLIDE: Show aircraft within 25mi of location
+                        # Every FLIGHT_POLL_INTERVAL seconds (typically 10-30s), we query 3
+                        # flight tracking APIs in parallel (adsblol, airplanes.live, adsbfi)
+                        # in a background thread so the display doesn't freeze.
+                        # ─────────────────────────────────────────────────────────────────
+                        if now - last_flight_poll >= FLIGHT_POLL_INTERVAL:
+                            last_flight_poll = now
+                            flights.start_poll()  # Spawn background thread with 3 parallel API requests
+
+                        # Get interpolated flight list (positions updated smoothly between API calls)
+                        planes = flights.get_interpolated_planes()
+                        last_planes = planes  # Cache for status file
+
+                        # For each new plane, fetch its route (origin/dest) in background so we
+                        # have full details before showing it
+                        for p in planes:
+                            _cs = p["callsign"]
+                            if _cs not in flights.route_cache and _cs not in flights._route_pending:
+                                flights._route_pending.add(_cs)
+                                threading.Thread(target=flights.get_route_info, args=(_cs,), daemon=True).start()
+
+                        if planes:
+                            # Rotate through planes every 6 seconds (shows each plane at least once)
+                            idx = int(now / 6) % len(planes)
+                            p = planes[idx]
+                            _cs = p["callsign"]
+                            route = flights.route_cache.get(_cs) or {"origin":None,"dest":None,"airline_icao":None,"airline_name":None,"expiry":0}
+                            display_pil_image(render_flight_image(p, route))
+                        else:
+                            # No flights in range — show "NO FLIGHTS" screen
+                            img = Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT), (0, 0, 0))
+                            d2 = ImageDraw.Draw(img)
+                            d2.text((32, 22), "NO", font=get_font(16), fill=(55, 55, 75), anchor="mm")
+                            d2.text((32, 40), "FLIGHTS", font=get_font(10), fill=(45, 45, 65), anchor="mm")
+                            display_pil_image(img)
+                        last_render = now
+
+                    elif cs_slot == "iss":
+                        # ─────────────────────────────────────────────────────────────────
+                        # ISS SLIDE: Show International Space Station state
+                        # Every ISS_POLL_INTERVAL seconds (typically 10-30s), we query the
+                        # open-notify.org API in a background thread to get current ISS position
+                        # and calculate distance from our location.
+                        # ─────────────────────────────────────────────────────────────────
+                        if now - last_iss_poll >= ISS_POLL_INTERVAL and not _iss_polling[0]:
+                            last_iss_poll = now
+                            def _poll_iss_lock(flag=_iss_polling):
+                                flag[0] = True
+                                try: iss.poll()
+                                finally: flag[0] = False
+                            threading.Thread(target=_poll_iss_lock, daemon=True).start()
+                        display_pil_image(render_iss(iss))
+                        last_render = now
+
+                    time.sleep(0.5)
+                    continue
+
+                # ─────────────────────────────────────────────────────────────────────────
+                # BACKGROUND POLLING: Keep all data sources fresh in parallel threads
+                # We poll on timers to avoid constant API hammering; each poll runs in a
+                # daemon thread so the main loop never blocks on network I/O.
+                # ─────────────────────────────────────────────────────────────────────────
+
+                # Kick off new flight API queries if the last poll is stale
+                if now - last_flight_poll >= FLIGHT_POLL_INTERVAL:
+                    last_flight_poll = now
+                    flights.start_poll()  # Runs 3 parallel API requests in background
+
+                # Kick off ISS position query if stale (and we're not already polling)
+                if now - last_iss_poll >= ISS_POLL_INTERVAL and not _iss_polling[0]:
+                    last_iss_poll = now
+                    def _poll_iss(flag=_iss_polling):
+                        flag[0] = True  # Set flag so we don't double-query
+                        try: iss.poll()
+                        finally: flag[0] = False  # Clear flag when done
+                    threading.Thread(target=_poll_iss, daemon=True).start()
+
+                # HomePod: Check if any HomePod is currently playing music
+                # This is non-blocking (just reads cached state from async HomePodManager)
+                if homepod:
+                    current_homepod = homepod.get_playing()
+
+                # Spotify: Poll Spotify API for currently-playing track
+                # Only poll if: (1) Spotify is auth'd, (2) interval has elapsed, (3) not already polling
+                if spotify and now - last_spotify_poll >= SPOTIFY_POLL_INTERVAL and not _sp_box[2]:
+                    last_spotify_poll = now
+                    def _poll_sp(box=_sp_box):
+                        box[2] = True  # Set flag: polling in progress
+                        try:
+                            box[0] = spotify.get_currently_playing()  # Fetch track info from Spotify
+                        except Exception as e:
+                            print("Spotify poll error: "+str(e))
+                            box[0] = None  # Clear on error so we don't show stale music
+                        finally:
+                            box[1] = True   # Signal that new data is ready
+                            box[2] = False  # Clear flag: polling complete
+                    threading.Thread(target=_poll_sp, daemon=True).start()
+
+                # Check if Spotify poll just finished and update current_spotify if it did
+                if _sp_box[1]:
+                    _sp_box[1] = False  # Reset the "new data" flag
+                    current_spotify = _sp_box[0]  # Use the freshly polled result
+
+                # Weather / AQI / Sun: refresh in a daemon thread. The clients cache
+                # internally (10-min weather/AQI, per-day sun) and persist to disk, so
+                # this only touches the network occasionally — but when it does, the
+                # open-meteo timeout + wttr.in fallback can take seconds, which must
+                # never happen on the display thread. We poll every 60s; the clients
+                # decide whether an actual request is needed.
+                if now - last_wx_poll >= 60 and not _wx_box[3]:
+                    last_wx_poll = now
+                    def _poll_wx(box=_wx_box):
+                        box[3] = True
+                        try:
+                            box[0] = weather.fetch()
+                            box[1] = aqi_client.fetch()
+                            box[2] = sun_client.fetch()
+                        except Exception as e:
+                            print("Weather/sun poll error: " + str(e))
+                        finally:
+                            box[3] = False
+                    threading.Thread(target=_poll_wx, daemon=True).start()
+                # Adopt the freshest background results (never overwrite good data with None)
+                if _wx_box[0] is not None: cached_weather = _wx_box[0]
+                if _wx_box[1] is not None: cached_aqi     = _wx_box[1]
+                if _wx_box[2] is not None: cached_sun     = _wx_box[2]
+
+                # ─────────────────────────────────────────────────────────────────────────
+                # PRIORITY 1: FLIGHT INTERRUPTS — Show planes in range, highest priority
+                # Flights always interrupt the slide rotation. Each plane shows for
+                # PLANE_DISPLAY_DURATION seconds, then waits PLANE_REPEAT_INTERVAL before
+                # showing again (to avoid spam).
+                # ─────────────────────────────────────────────────────────────────────────
+                planes = flights.get_interpolated_planes()
+                last_planes = planes  # Cache for status file
+                in_range = {p["callsign"] for p in planes}  # Current callsigns in range
+                # Clean up cooldown tracking for planes that have left our airspace
+                for cs in [k for k in plane_last_shown if k not in in_range]:
+                    del plane_last_shown[cs]  # Reset so it can be shown again if it re-enters
+
+                # Kick off background route fetches for any new planes without route info yet
+                # (one thread per callsign, with duplicate-prevention)
+                for p in planes:
+                    cs = p["callsign"]
+                    if cs not in flights.route_cache and cs not in flights._route_pending:
+                        flights._route_pending.add(cs)  # Mark as "fetch in progress"
+                        # Fetch route (origin/dest/airline) in background so the flight display
+                        # will be complete when it's shown
+                        threading.Thread(target=flights.get_route_info, args=(cs,), daemon=True).start()
+
+                # ─────────────────────────────────────────────────────────────────────────
+                # MANUAL FLIGHT SEARCH: User can search for a specific callsign via web UI
+                # If found locally, shows immediately; if not in range, searches globally
+                # via OpenSky API and shows it if found.
+                # ─────────────────────────────────────────────────────────────────────────
+                manual_cs = get_manual_track_callsign()  # Read callsign from web override file
+
+                # Show "not found" screen for 4s after timeout, then fully clear
+                if manual_not_found_until > 0:
+                    if now < manual_not_found_until:
+                        img = Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT), (0, 0, 0))
+                        d = ImageDraw.Draw(img)
+                        d.rectangle([(0,0),(63,63)], outline=(120,0,0))
+                        d.text((32, 14), "NOT", font=get_font(14), fill=(220, 50, 50), anchor="mm")
+                        d.text((32, 29), "FOUND", font=get_font(14), fill=(220, 50, 50), anchor="mm")
+                        d.text((32, 44), last_manual_cs or "", font=get_font(8), fill=(160, 160, 160), anchor="mm")
+                        d.text((32, 56), "resuming...", font=get_font(6), fill=(80, 80, 80), anchor="mm")
+                        display_pil_image(img)
+                        in_interrupt = True
+                        time.sleep(0.5)
+                        continue
+                    else:
+                        manual_not_found_until = 0
+                        last_manual_cs = None
+
+                if not manual_cs:
+                    # Reset so the same callsign can be re-searched cleanly next time
+                    if last_manual_cs is not None:
+                        last_manual_cs = None
+                        _manual_box[0] = None
+
+                if manual_cs:
+                    if manual_cs != last_manual_cs:
+                        _manual_box[0] = None
+                        manual_plane_fetch_time = 0
+                        manual_search_start = now
+                        last_manual_cs = manual_cs
+                        write_track_status(manual_cs, "searching")
+
+                    # Timeout after 60s — show not-found screen then resume
+                    if _manual_box[0] is None and now - manual_search_start >= 60:
+                        manual_not_found_until = now + 4
+                        write_track_status(None, "not_found", last_manual_cs)
+                    else:
+                        # Prefer live in-radius data, fall back to global fetch
+                        manual_plane = next((p for p in planes if p["callsign"] == manual_cs), None)
+                        if not manual_plane:
+                            if now - manual_plane_fetch_time >= 10:
+                                manual_plane_fetch_time = now
+                                def _fetch_manual(cs=manual_cs, box=_manual_box):
+                                    box[0] = flights.fetch_by_callsign(cs)
+                                threading.Thread(target=_fetch_manual, daemon=True).start()
+                            manual_plane = _manual_box[0]
+                        if manual_plane:
+                            write_track_status(manual_cs, "tracking")
+                            if manual_cs not in flights.route_cache and manual_cs not in flights._route_pending:
+                                flights._route_pending.add(manual_cs)
+                                threading.Thread(target=flights.get_route_info, args=(manual_cs,), daemon=True).start()
+                            route = flights.route_cache.get(manual_cs) or {"origin":None,"dest":None,"airline_icao":None,"airline_name":None,"expiry":0}
+                            # Cycle: 5s standard card, 5s detail card
+                            if int(now / 5) % 2 == 0:
+                                display_pil_image(render_flight_image(manual_plane, route))
+                            else:
+                                display_pil_image(render_flight_detail(manual_plane, route))
+                        else:
+                            # Searching screen
+                            dot_count = int(now * 1.5) % 3 + 1
+                            img = Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT), (0, 0, 0))
+                            d = ImageDraw.Draw(img)
+                            # Plane icon (polygon, always works)
+                            cx, cy = 32, 16
+                            c = (255, 200, 0)
+                            d.ellipse([(cx-2, cy-8),(cx+2, cy+8)], fill=c)
+                            d.polygon([(cx-12, cy+4),(cx+12, cy+4),(cx+2,cy-1),(cx-2,cy-1)], fill=c)
+                            d.polygon([(cx-5,cy+7),(cx+5,cy+7),(cx+2,cy+4),(cx-2,cy+4)], fill=c)
+                            # Callsign
+                            d.text((32, 32), manual_cs, font=get_font(9), fill=(255, 255, 255), anchor="mm")
+                            # Searching label
+                            d.text((32, 44), "SEARCHING", font=get_font(6), fill=(150, 120, 0), anchor="mm")
+                            # Animated dots
+                            dots_str = " " + "●" * dot_count + "○" * (3 - dot_count)
+                            d.text((32, 55), dots_str, font=get_font(7), fill=(255, 180, 0), anchor="mm")
+                            display_pil_image(img)
+                        in_interrupt = True
+                        time.sleep(0.5)
+                        continue
+
+                valid_planes = []
+                for p in planes:
+                    cs = p["callsign"]
+                    last_finished = plane_last_shown.get(cs, 0)
+                    if last_finished != 0 and now - last_finished < PLANE_REPEAT_INTERVAL:
+                        continue  # finished showing recently, in cooldown
+                    route = flights.route_cache.get(cs) or {"origin":None,"dest":None,"airline_icao":None,"airline_name":None,"expiry":0}
+                    ai_check = route.get("airline_icao") or (
+                        cs[:3].upper() if len(cs) >= 3 and cs[:3].isalpha() else None)
+                    has_route = bool(route.get("origin") or route.get("dest"))
+                    if ai_check and has_route:
+                        valid_planes.append((p, route))
+
+                if valid_planes and "flights" not in disabled_slots:
+                    p, route = valid_planes[0]
+                    cs = p["callsign"]
+                    if cs != current_plane_cs:
+                        # ── NEW PLANE DETECTED ───────────────────────────────────
+                        # 1) Render the flight card ONCE and cache it (rendering every
+                        #    frame is wasteful and was a source of micro-stutter).
+                        # 2) Play the fly-in animation SYNCHRONOUSLY (blocks ~3.2s).
+                        #    We deliberately do NOT show the card before the animation,
+                        #    so the card never "flashes" in before the plane wipes it on.
+                        #    Synchronous = single display writer = zero flicker.
+                        current_plane_cs = cs
+                        _current_plane_image = render_flight_image(p, route)   # render once
+                        print("PLANE: "+cs+" "+str(round(p["distance"],1))+"mi "+str(p["altitude_ft"])+"ft")
+                        if route.get("origin") and route.get("dest"):
+                            print("  "+route["origin"]+" -> "+route["dest"])
+                        try:
+                            do_plane_transition(_current_plane_image)          # fly-in intro
+                        except Exception as e:
+                            print(f"Plane transition error: {e}")
+                        # Start the on-screen hold AFTER the animation finishes so the
+                        # static card gets its full PLANE_DISPLAY_DURATION of screen time.
+                        current_plane_show_start = time.time()
+                    if time.time() - current_plane_show_start < PLANE_DISPLAY_DURATION:
+                        # Hold the cached card (no re-render → no stutter, no flicker).
+                        display_pil_image(_current_plane_image)
+                        in_interrupt = True
+                        time.sleep(0.5)
+                        continue
+                    else:
+                        plane_last_shown[cs] = now  # mark FINISHED — start cooldown
+                        current_plane_cs = None
+                else:
+                    current_plane_cs = None
+
+                # PRIORITY 2: ISS — show while overhead (requires fresh data)
+                if iss.distance is not None and iss.distance < ISS_OVERHEAD_RADIUS_MILES and iss.is_fresh() and "iss" not in disabled_slots:
+                    if not iss_logged:
+                        iss_logged = True
+                        print("ISS OVERHEAD: "+str(int(iss.distance))+"mi")
+                    display_pil_image(render_iss(iss))
+                    in_interrupt = True
+                    time.sleep(0.5)
+                    continue
+                else:
+                    iss_logged = False
+
+                # Track art paths — update when song changes
+                if current_spotify:
+                    sk = (current_spotify.get("track","")) + "|" + (current_spotify.get("artist",""))
+                    if sk != last_sp_key:
+                        last_sp_key = sk
+                        print("SP: "+current_spotify.get("track","?")+" - "+current_spotify.get("artist","?"))
+                        au = current_spotify.get("image_url")
+                        current_sp_art_path = download_art(au, "spotify") if au else None
+                else:
+                    last_sp_key = None; current_sp_art_path = None
+
+                if current_homepod:
+                    hk = (current_homepod.get("track","")) + "|" + (current_homepod.get("artist",""))
+                    if hk != last_hp_key:
+                        last_hp_key = hk
+                        print("HP: "+current_homepod.get("track","?")+" - "+current_homepod.get("artist","?"))
+                        au = current_homepod.get("image_url")
+                        if au:
+                            current_hp_art_path = au if current_homepod.get("is_local_file") else download_art(au, "homepod")
+                        else:
+                            current_hp_art_path = None
+                else:
+                    last_hp_key = None; current_hp_art_path = None
+
+                # PRIORITY 3: MUSIC — show album art while playing
+                if current_spotify and current_homepod:
+                    # Both playing — split view with labels
+                    display_pil_image(render_dual_music(
+                        current_spotify, current_sp_art_path,
+                        current_homepod, current_hp_art_path))
+                    in_interrupt = True
+                    time.sleep(0.5)
+                    continue
+                elif current_spotify or current_homepod:
+                    music = current_spotify if current_spotify else current_homepod
+                    art_path = current_sp_art_path if current_spotify else current_hp_art_path
+                    # Display music — either artwork or the music info even if no artwork
+                    if art_path:
+                        display_image_file(art_path)
+                    else:
+                        # No artwork — still show the music source indicator
+                        source = "SP" if current_spotify else "HP"
+                        img = Image.new("RGB", (MATRIX_WIDTH, MATRIX_HEIGHT), (0, 0, 0))
+                        d = ImageDraw.Draw(img)
+                        d.text((32, 32), source, font=get_font(20), fill=(100, 100, 255), anchor="mm")
+                        display_pil_image(img)
+                    in_interrupt = True
+                    time.sleep(0.5)
+                    continue
+
+                # RETURNING FROM INTERRUPT — reset slot so it re-renders cleanly
+                if in_interrupt:
+                    in_interrupt = False
+                    last_render = 0
+                    last_clock_tick = 0
+
+                anim_frame = int(now * 2)  # 2 ticks/sec, time-based so interrupts don't slow it
+
+                # NORMAL SLOT CYCLE
+                active_slots = [s for s in SLOTS if s not in disabled_slots]
+
+                # All slides disabled — turn display off
+                if not active_slots:
+                    _send_raw(Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT), (0, 0, 0)))
+                    time.sleep(0.5)
+                    continue
+
+                if SLOTS[slot_idx] in disabled_slots:
+                    slot_idx = next((i for i, s in enumerate(SLOTS) if s not in disabled_slots), 0)
+                    slot_start = now; last_render = 0; last_clock_tick = 0; current_photo_path = None
+                cur_slot_dur = SLOT_DURATIONS.get(SLOTS[slot_idx], SLOT_DURATION)
+                if now - slot_start >= cur_slot_dur:
+                    cur_pos   = active_slots.index(SLOTS[slot_idx]) if SLOTS[slot_idx] in active_slots else 0
+                    next_slot = active_slots[(cur_pos + 1) % len(active_slots)]
+                    # Pre-render the incoming slide so the fade goes slide→slide, not slide→black
+                    try:
+                        if next_slot == "clock":
+                            _next_img = render_clock()
+                        elif next_slot == "weather":
+                            _next_img = render_weather(cached_weather, cached_aqi, anim_frame)
+                        elif next_slot == "sun":
+                            _next_img = render_sun(cached_sun, cached_weather)
+                        else:
+                            _next_img = None   # photos vary; fade to black is fine
+                    except Exception:
+                        _next_img = None
+                    do_transition(_next_img)
+                    slot_idx   = SLOTS.index(next_slot)
+                    slot_start = now
+                    last_render = 0
+                    last_clock_tick = 0
+                    current_photo_path = None
+                cs_slot = SLOTS[slot_idx]
 
                 if cs_slot == "clock":
                     if now - last_clock_tick >= CLOCK_REFRESH_INTERVAL:
+                        if last_render == 0: print("CYCLE: clock")
                         display_pil_image(render_clock())
                         last_clock_tick = now; last_render = now
 
                 elif cs_slot == "weather":
-                    if last_render == 0 or now - weather_fetch_time >= 30:
-                        cached_weather = weather.fetch()
-                        cached_aqi = aqi_client.fetch()
-                        weather_fetch_time = now
+                    # cached_weather/cached_aqi are kept fresh by _poll_wx — render only.
+                    if last_render == 0: print("CYCLE: weather")
                     display_pil_image(render_weather(cached_weather, cached_aqi, anim_frame))
                     last_render = now
 
                 elif cs_slot == "sun":
-                    if last_render == 0 or now - last_render >= 30:
-                        display_pil_image(render_sun(sun_client.fetch(), cached_weather))
+                    if last_render == 0:
+                        print("CYCLE: sun")
+                        display_pil_image(render_sun(cached_sun, cached_weather))
+                        last_render = now
+                    elif now - last_render >= 30:
+                        display_pil_image(render_sun(cached_sun, cached_weather))
                         last_render = now
 
                 elif cs_slot == "photos":
                     if current_photo_path is None:
                         photo = pick_photo(last_forced_photo)
-                        if photo:
-                            current_photo_path = photo
+                        if photo is None:
+                            print("CYCLE: photos empty, skipping")
+                            cur_pos = active_slots.index("photos") if "photos" in active_slots else 0
+                            next_slot = active_slots[(cur_pos + 1) % len(active_slots)]
+                            slot_idx = SLOTS.index(next_slot)
+                            slot_start = now
                             last_render = 0
-                    if current_photo_path and last_render == 0:
+                            current_photo_path = None
+                            continue
+                        current_photo_path = photo
+                        print("CYCLE: photo "+os.path.basename(photo)[:30])
+                    if last_render == 0:
                         try:
                             _ps = _load_photo_settings()
                             _pn = os.path.basename(current_photo_path)
                             display_pil_image(zoom_to_fill_64(Image.open(current_photo_path), _ps.get(_pn)), photo=True)
-                        except Exception:
+                        except Exception as e:
+                            print("Photo error: "+str(e))
                             current_photo_path = None
                         last_render = now
 
-                elif cs_slot == "flights":
-                    # ─────────────────────────────────────────────────────────────────
-                    # FLIGHTS SLIDE: Show aircraft within 25mi of location
-                    # Every FLIGHT_POLL_INTERVAL seconds (typically 10-30s), we query 3
-                    # flight tracking APIs in parallel (adsblol, airplanes.live, adsbfi)
-                    # in a background thread so the display doesn't freeze.
-                    # ─────────────────────────────────────────────────────────────────
-                    if now - last_flight_poll >= FLIGHT_POLL_INTERVAL:
-                        last_flight_poll = now
-                        flights.start_poll()  # Spawn background thread with 3 parallel API requests
-
-                    # Get interpolated flight list (positions updated smoothly between API calls)
-                    planes = flights.get_interpolated_planes()
-                    last_planes = planes  # Cache for status file
-
-                    # For each new plane, fetch its route (origin/dest) in background so we
-                    # have full details before showing it
-                    for p in planes:
-                        _cs = p["callsign"]
-                        if _cs not in flights.route_cache and _cs not in flights._route_pending:
-                            flights._route_pending.add(_cs)
-                            threading.Thread(target=flights.get_route_info, args=(_cs,), daemon=True).start()
-
-                    if planes:
-                        # Rotate through planes every 6 seconds (shows each plane at least once)
-                        idx = int(now / 6) % len(planes)
-                        p = planes[idx]
-                        _cs = p["callsign"]
-                        route = flights.route_cache.get(_cs) or {"origin":None,"dest":None,"airline_icao":None,"airline_name":None,"expiry":0}
-                        display_pil_image(render_flight_image(p, route))
-                    else:
-                        # No flights in range — show "NO FLIGHTS" screen
-                        img = Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT), (0, 0, 0))
-                        d2 = ImageDraw.Draw(img)
-                        d2.text((32, 22), "NO", font=get_font(16), fill=(55, 55, 75), anchor="mm")
-                        d2.text((32, 40), "FLIGHTS", font=get_font(10), fill=(45, 45, 65), anchor="mm")
-                        display_pil_image(img)
-                    last_render = now
-
-                elif cs_slot == "iss":
-                    # ─────────────────────────────────────────────────────────────────
-                    # ISS SLIDE: Show International Space Station state
-                    # Every ISS_POLL_INTERVAL seconds (typically 10-30s), we query the
-                    # open-notify.org API in a background thread to get current ISS position
-                    # and calculate distance from our location.
-                    # ─────────────────────────────────────────────────────────────────
-                    if now - last_iss_poll >= ISS_POLL_INTERVAL and not _iss_polling[0]:
-                        last_iss_poll = now
-                        def _poll_iss_lock(flag=_iss_polling):
-                            flag[0] = True
-                            try: iss.poll()
-                            finally: flag[0] = False
-                        threading.Thread(target=_poll_iss_lock, daemon=True).start()
-                    display_pil_image(render_iss(iss))
-                    last_render = now
-
                 time.sleep(0.5)
-                continue
-
-            # ─────────────────────────────────────────────────────────────────────────
-            # BACKGROUND POLLING: Keep all data sources fresh in parallel threads
-            # We poll on timers to avoid constant API hammering; each poll runs in a
-            # daemon thread so the main loop never blocks on network I/O.
-            # ─────────────────────────────────────────────────────────────────────────
-
-            # Kick off new flight API queries if the last poll is stale
-            if now - last_flight_poll >= FLIGHT_POLL_INTERVAL:
-                last_flight_poll = now
-                flights.start_poll()  # Runs 3 parallel API requests in background
-
-            # Kick off ISS position query if stale (and we're not already polling)
-            if now - last_iss_poll >= ISS_POLL_INTERVAL and not _iss_polling[0]:
-                last_iss_poll = now
-                def _poll_iss(flag=_iss_polling):
-                    flag[0] = True  # Set flag so we don't double-query
-                    try: iss.poll()
-                    finally: flag[0] = False  # Clear flag when done
-                threading.Thread(target=_poll_iss, daemon=True).start()
-
-            # HomePod: Check if any HomePod is currently playing music
-            # This is non-blocking (just reads cached state from async HomePodManager)
-            if homepod:
-                current_homepod = homepod.get_playing()
-
-            # Spotify: Poll Spotify API for currently-playing track
-            # Only poll if: (1) Spotify is auth'd, (2) interval has elapsed, (3) not already polling
-            if spotify and now - last_spotify_poll >= SPOTIFY_POLL_INTERVAL and not _sp_box[2]:
-                last_spotify_poll = now
-                def _poll_sp(box=_sp_box):
-                    box[2] = True  # Set flag: polling in progress
-                    try:
-                        box[0] = spotify.get_currently_playing()  # Fetch track info from Spotify
-                    except Exception as e:
-                        print("Spotify poll error: "+str(e))
-                        box[0] = None  # Clear on error so we don't show stale music
-                    finally:
-                        box[1] = True   # Signal that new data is ready
-                        box[2] = False  # Clear flag: polling complete
-                threading.Thread(target=_poll_sp, daemon=True).start()
-
-            # Check if Spotify poll just finished and update current_spotify if it did
-            if _sp_box[1]:
-                _sp_box[1] = False  # Reset the "new data" flag
-                current_spotify = _sp_box[0]  # Use the freshly polled result
-
-            # ─────────────────────────────────────────────────────────────────────────
-            # PRIORITY 1: FLIGHT INTERRUPTS — Show planes in range, highest priority
-            # Flights always interrupt the slide rotation. Each plane shows for
-            # PLANE_DISPLAY_DURATION seconds, then waits PLANE_REPEAT_INTERVAL before
-            # showing again (to avoid spam).
-            # ─────────────────────────────────────────────────────────────────────────
-            planes = flights.get_interpolated_planes()
-            last_planes = planes  # Cache for status file
-            in_range = {p["callsign"] for p in planes}  # Current callsigns in range
-            # Clean up cooldown tracking for planes that have left our airspace
-            for cs in [k for k in plane_last_shown if k not in in_range]:
-                del plane_last_shown[cs]  # Reset so it can be shown again if it re-enters
-
-            # Kick off background route fetches for any new planes without route info yet
-            # (one thread per callsign, with duplicate-prevention)
-            for p in planes:
-                cs = p["callsign"]
-                if cs not in flights.route_cache and cs not in flights._route_pending:
-                    flights._route_pending.add(cs)  # Mark as "fetch in progress"
-                    # Fetch route (origin/dest/airline) in background so the flight display
-                    # will be complete when it's shown
-                    threading.Thread(target=flights.get_route_info, args=(cs,), daemon=True).start()
-
-            # ─────────────────────────────────────────────────────────────────────────
-            # MANUAL FLIGHT SEARCH: User can search for a specific callsign via web UI
-            # If found locally, shows immediately; if not in range, searches globally
-            # via OpenSky API and shows it if found.
-            # ─────────────────────────────────────────────────────────────────────────
-            manual_cs = get_manual_track_callsign()  # Read callsign from web override file
-
-            # Show "not found" screen for 4s after timeout, then fully clear
-            if manual_not_found_until > 0:
-                if now < manual_not_found_until:
-                    img = Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT), (0, 0, 0))
-                    d = ImageDraw.Draw(img)
-                    d.rectangle([(0,0),(63,63)], outline=(120,0,0))
-                    d.text((32, 14), "NOT", font=get_font(14), fill=(220, 50, 50), anchor="mm")
-                    d.text((32, 29), "FOUND", font=get_font(14), fill=(220, 50, 50), anchor="mm")
-                    d.text((32, 44), last_manual_cs or "", font=get_font(8), fill=(160, 160, 160), anchor="mm")
-                    d.text((32, 56), "resuming...", font=get_font(6), fill=(80, 80, 80), anchor="mm")
-                    display_pil_image(img)
-                    in_interrupt = True
-                    time.sleep(0.5)
-                    continue
-                else:
-                    manual_not_found_until = 0
-                    last_manual_cs = None
-
-            if not manual_cs:
-                # Reset so the same callsign can be re-searched cleanly next time
-                if last_manual_cs is not None:
-                    last_manual_cs = None
-                    _manual_box[0] = None
-
-            if manual_cs:
-                if manual_cs != last_manual_cs:
-                    _manual_box[0] = None
-                    manual_plane_fetch_time = 0
-                    manual_search_start = now
-                    last_manual_cs = manual_cs
-                    write_track_status(manual_cs, "searching")
-
-                # Timeout after 60s — show not-found screen then resume
-                if _manual_box[0] is None and now - manual_search_start >= 60:
-                    manual_not_found_until = now + 4
-                    write_track_status(None, "not_found", last_manual_cs)
-                else:
-                    # Prefer live in-radius data, fall back to global fetch
-                    manual_plane = next((p for p in planes if p["callsign"] == manual_cs), None)
-                    if not manual_plane:
-                        if now - manual_plane_fetch_time >= 10:
-                            manual_plane_fetch_time = now
-                            def _fetch_manual(cs=manual_cs, box=_manual_box):
-                                box[0] = flights.fetch_by_callsign(cs)
-                            threading.Thread(target=_fetch_manual, daemon=True).start()
-                        manual_plane = _manual_box[0]
-                    if manual_plane:
-                        write_track_status(manual_cs, "tracking")
-                        if manual_cs not in flights.route_cache and manual_cs not in flights._route_pending:
-                            flights._route_pending.add(manual_cs)
-                            threading.Thread(target=flights.get_route_info, args=(manual_cs,), daemon=True).start()
-                        route = flights.route_cache.get(manual_cs) or {"origin":None,"dest":None,"airline_icao":None,"airline_name":None,"expiry":0}
-                        # Cycle: 5s standard card, 5s detail card
-                        if int(now / 5) % 2 == 0:
-                            display_pil_image(render_flight_image(manual_plane, route))
-                        else:
-                            display_pil_image(render_flight_detail(manual_plane, route))
-                    else:
-                        # Searching screen
-                        dot_count = int(now * 1.5) % 3 + 1
-                        img = Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT), (0, 0, 0))
-                        d = ImageDraw.Draw(img)
-                        # Plane icon (polygon, always works)
-                        cx, cy = 32, 16
-                        c = (255, 200, 0)
-                        d.ellipse([(cx-2, cy-8),(cx+2, cy+8)], fill=c)
-                        d.polygon([(cx-12, cy+4),(cx+12, cy+4),(cx+2,cy-1),(cx-2,cy-1)], fill=c)
-                        d.polygon([(cx-5,cy+7),(cx+5,cy+7),(cx+2,cy+4),(cx-2,cy+4)], fill=c)
-                        # Callsign
-                        d.text((32, 32), manual_cs, font=get_font(9), fill=(255, 255, 255), anchor="mm")
-                        # Searching label
-                        d.text((32, 44), "SEARCHING", font=get_font(6), fill=(150, 120, 0), anchor="mm")
-                        # Animated dots
-                        dots_str = " " + "●" * dot_count + "○" * (3 - dot_count)
-                        d.text((32, 55), dots_str, font=get_font(7), fill=(255, 180, 0), anchor="mm")
-                        display_pil_image(img)
-                    in_interrupt = True
-                    time.sleep(0.5)
-                    continue
-
-            valid_planes = []
-            for p in planes:
-                cs = p["callsign"]
-                last_finished = plane_last_shown.get(cs, 0)
-                if last_finished != 0 and now - last_finished < PLANE_REPEAT_INTERVAL:
-                    continue  # finished showing recently, in cooldown
-                route = flights.route_cache.get(cs) or {"origin":None,"dest":None,"airline_icao":None,"airline_name":None,"expiry":0}
-                ai_check = route.get("airline_icao") or (
-                    cs[:3].upper() if len(cs) >= 3 and cs[:3].isalpha() else None)
-                has_route = bool(route.get("origin") or route.get("dest"))
-                if ai_check and has_route:
-                    valid_planes.append((p, route))
-
-            if valid_planes and "flights" not in disabled_slots:
-                p, route = valid_planes[0]
-                cs = p["callsign"]
-                if cs != current_plane_cs:
-                    current_plane_cs = cs
-                    current_plane_show_start = now
-                    # plane_last_shown set AFTER display completes, not on detection
-                    print("PLANE: "+cs+" "+str(round(p["distance"],1))+"mi "+str(p["altitude_ft"])+"ft")
-                    # Run plane transition in background so main loop (clock display) isn't blocked
-                    do_plane_transition_async(render_flight_image(p, route))
-                    if route.get("origin") and route.get("dest"):
-                        print("  "+route["origin"]+" -> "+route["dest"])
-                if now - current_plane_show_start < PLANE_DISPLAY_DURATION:
-                    display_pil_image(render_flight_image(p, route))
-                    in_interrupt = True
-                    time.sleep(0.5)
-                    continue
-                else:
-                    plane_last_shown[cs] = now  # mark FINISHED — start cooldown
-                    current_plane_cs = None
-            else:
-                current_plane_cs = None
-
-            # PRIORITY 2: ISS — show while overhead (requires fresh data)
-            if iss.distance is not None and iss.distance < ISS_OVERHEAD_RADIUS_MILES and iss.is_fresh() and "iss" not in disabled_slots:
-                if not iss_logged:
-                    iss_logged = True
-                    print("ISS OVERHEAD: "+str(int(iss.distance))+"mi")
-                display_pil_image(render_iss(iss))
-                in_interrupt = True
+            except Exception as _frame_err:
+                # A single bad frame (malformed API data, a transient render
+                # error, a flaky socket) must never take down the whole display.
+                # Log it and keep the loop alive instead of crashing out to systemd
+                # and replaying the entire boot/globe-intro sequence.
+                import traceback
+                print("Main-loop frame error: " + str(_frame_err))
+                traceback.print_exc()
                 time.sleep(0.5)
-                continue
-            else:
-                iss_logged = False
-
-            # Track art paths — update when song changes
-            if current_spotify:
-                sk = (current_spotify.get("track","")) + "|" + (current_spotify.get("artist",""))
-                if sk != last_sp_key:
-                    last_sp_key = sk
-                    print("SP: "+current_spotify.get("track","?")+" - "+current_spotify.get("artist","?"))
-                    au = current_spotify.get("image_url")
-                    current_sp_art_path = download_art(au, "spotify") if au else None
-            else:
-                last_sp_key = None; current_sp_art_path = None
-
-            if current_homepod:
-                hk = (current_homepod.get("track","")) + "|" + (current_homepod.get("artist",""))
-                if hk != last_hp_key:
-                    last_hp_key = hk
-                    print("HP: "+current_homepod.get("track","?")+" - "+current_homepod.get("artist","?"))
-                    au = current_homepod.get("image_url")
-                    if au:
-                        current_hp_art_path = au if current_homepod.get("is_local_file") else download_art(au, "homepod")
-                    else:
-                        current_hp_art_path = None
-            else:
-                last_hp_key = None; current_hp_art_path = None
-
-            # PRIORITY 3: MUSIC — show album art while playing
-            if current_spotify and current_homepod:
-                # Both playing — split view with labels
-                display_pil_image(render_dual_music(
-                    current_spotify, current_sp_art_path,
-                    current_homepod, current_hp_art_path))
-                in_interrupt = True
-                time.sleep(0.5)
-                continue
-            elif current_spotify or current_homepod:
-                art_path = current_sp_art_path if current_spotify else current_hp_art_path
-                if art_path:
-                    display_image_file(art_path)
-                    in_interrupt = True
-                    time.sleep(0.5)
-                    continue
-
-            # RETURNING FROM INTERRUPT — reset slot so it re-renders cleanly
-            if in_interrupt:
-                in_interrupt = False
-                last_render = 0
-                last_clock_tick = 0
-
-            anim_frame = int(now * 2)  # 2 ticks/sec, time-based so interrupts don't slow it
-
-            # NORMAL SLOT CYCLE
-            active_slots = [s for s in SLOTS if s not in disabled_slots]
-
-            # All slides disabled — turn display off
-            if not active_slots:
-                _send_raw(Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT), (0, 0, 0)))
-                time.sleep(0.5)
-                continue
-
-            if SLOTS[slot_idx] in disabled_slots:
-                slot_idx = next((i for i, s in enumerate(SLOTS) if s not in disabled_slots), 0)
-                slot_start = now; last_render = 0; last_clock_tick = 0; current_photo_path = None
-            cur_slot_dur = SLOT_DURATIONS.get(SLOTS[slot_idx], SLOT_DURATION)
-            if now - slot_start >= cur_slot_dur:
-                do_transition()
-                cur_pos = active_slots.index(SLOTS[slot_idx]) if SLOTS[slot_idx] in active_slots else 0
-                next_slot = active_slots[(cur_pos + 1) % len(active_slots)]
-                slot_idx = SLOTS.index(next_slot)
-                slot_start = now
-                last_render = 0
-                last_clock_tick = 0
-                current_photo_path = None
-            cs_slot = SLOTS[slot_idx]
-
-            if cs_slot == "clock":
-                if now - last_clock_tick >= CLOCK_REFRESH_INTERVAL:
-                    if last_render == 0: print("CYCLE: clock")
-                    display_pil_image(render_clock())
-                    last_clock_tick = now; last_render = now
-
-            elif cs_slot == "weather":
-                if last_render == 0 or now - weather_fetch_time >= 30:
-                    if last_render == 0: print("CYCLE: weather")
-                    cached_weather = weather.fetch()
-                    cached_aqi = aqi_client.fetch()
-                    weather_fetch_time = now
-                display_pil_image(render_weather(cached_weather, cached_aqi, anim_frame))
-                last_render = now
-
-            elif cs_slot == "sun":
-                if last_render == 0:
-                    print("CYCLE: sun")
-                    display_pil_image(render_sun(sun_client.fetch(), cached_weather))
-                    last_render = now
-                elif now - last_render >= 30:
-                    display_pil_image(render_sun(sun_client.fetch(), cached_weather))
-                    last_render = now
-
-            elif cs_slot == "photos":
-                if current_photo_path is None:
-                    photo = pick_photo(last_forced_photo)
-                    if photo is None:
-                        print("CYCLE: photos empty, skipping")
-                        cur_pos = active_slots.index("photos") if "photos" in active_slots else 0
-                        next_slot = active_slots[(cur_pos + 1) % len(active_slots)]
-                        slot_idx = SLOTS.index(next_slot)
-                        slot_start = now
-                        last_render = 0
-                        current_photo_path = None
-                        continue
-                    current_photo_path = photo
-                    print("CYCLE: photo "+os.path.basename(photo)[:30])
-                if last_render == 0:
-                    try:
-                        _ps = _load_photo_settings()
-                        _pn = os.path.basename(current_photo_path)
-                        display_pil_image(zoom_to_fill_64(Image.open(current_photo_path), _ps.get(_pn)), photo=True)
-                    except Exception as e:
-                        print("Photo error: "+str(e))
-                        current_photo_path = None
-                    last_render = now
-
-            time.sleep(0.5)
     except KeyboardInterrupt:
         print("Stopped")
 
