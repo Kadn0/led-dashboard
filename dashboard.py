@@ -103,7 +103,7 @@ from dashboard_config import (
     DEFAULT_BRIGHT_SCHEDULE as _DEFAULT_SCHEDULE,
     PHOTOS_DIR as _PHOTOS_DIR_STR,
     CACHE_DIR  as _CACHE_DIR_STR,
-    MANUAL_TRACK_FILE, STATUS_FILE, BRIGHT_SCHEDULE_FILE, PID_FILE,
+    MANUAL_TRACK_FILE, STATUS_FILE, OVERRIDE_FILE, BRIGHT_SCHEDULE_FILE, PID_FILE,
     PHOTO_SETTINGS_FILE as _PHOTO_SETTINGS_FILE_STR,
 )
 
@@ -352,8 +352,6 @@ WEATHER_LABELS = {
     85:"Snow",86:"Snow",95:"Storm",96:"Storm",99:"Storm",
 }
 
-OVERRIDE_FILE = "/home/kadn/dashboard_override.json"
-
 _override_cache = {}
 _override_cache_time = 0.0
 
@@ -440,7 +438,8 @@ def get_airline_logo(icao, iata=None):
     miss = LOGO_CACHE_DIR / (icao + ".miss")
     if miss.exists(): return None
     if cf.exists():
-        try: return Image.open(cf)
+        try:
+            with Image.open(cf) as _img: return _img.copy()
         except Exception: pass  # corrupt cache file — fall through to re-download
 
     # Resolve IATA code: prefer caller-supplied, then static map
@@ -470,7 +469,7 @@ def get_airline_logo(icao, iata=None):
             if img.mode in ("L", "LA") and len(r.content) < 1000:
                 continue
             img.save(cf, "PNG")
-            return Image.open(cf)
+            with Image.open(cf) as _img: return _img.copy()
         except Exception:
             pass
 
@@ -501,6 +500,7 @@ class HomePodManager:
         self._conns = {}    # identifier -> live pyatv connection
         self._cfgs  = {}    # identifier -> pyatv config object (from scan)
         self._result = None
+        self._result_time = 0.0
         self._lock   = threading.Lock()
         self._running = True
         self._last_scan = 0.0
@@ -620,39 +620,49 @@ class HomePodManager:
     async def _poll_loop(self):
         await self._scan()
         while self._running:
-            # Periodically re-scan to pick up newly appeared devices
-            if time.time() - self._last_scan > self.RESCAN_INTERVAL:
-                await self._scan()
+            try:
+                # Periodically re-scan to pick up newly appeared devices
+                if time.time() - self._last_scan > self.RESCAN_INTERVAL:
+                    await self._scan()
 
-            idents = list(self._cfgs.keys())
-            if idents:
-                print(f"[HomePod] Polling {len(idents)} device(s)")
-                results = await asyncio.gather(
-                    *[self._poll_one(i) for i in idents],
-                    return_exceptions=True)
-                print(f"[HomePod] Poll results: {len([r for r in results if isinstance(r, dict) and r])} playing")
-            else:
-                results = []
-            playing = next((r for r in results if isinstance(r, dict) and r), None)
-            if playing:
-                ap = None
-                if playing["artwork"]:
-                    ah = hashlib.md5(playing["artwork"]).hexdigest()
-                    af = CACHE_DIR / (playing["dtype"]+"_"+ah+".jpg")
-                    if not af.exists():
-                        try: Image.open(BytesIO(playing["artwork"])).save(af, "JPEG")
-                        except Exception: pass  # bad artwork bytes — skip art, still show track info
-                    if af.exists(): ap = str(af)
-                final = {"track": playing["title"], "artist": playing["artist"],
-                         "image_url": ap, "source": playing["dtype"], "is_local_file": True}
-            else:
-                final = None
-            with self._lock:
-                self._result = final
+                idents = list(self._cfgs.keys())
+                if idents:
+                    print(f"[HomePod] Polling {len(idents)} device(s)")
+                    results = await asyncio.gather(
+                        *[self._poll_one(i) for i in idents],
+                        return_exceptions=True)
+                    print(f"[HomePod] Poll results: {len([r for r in results if isinstance(r, dict) and r])} playing")
+                else:
+                    results = []
+                playing = next((r for r in results if isinstance(r, dict) and r), None)
+                if playing:
+                    ap = None
+                    if playing["artwork"]:
+                        ah = hashlib.md5(playing["artwork"]).hexdigest()
+                        af = CACHE_DIR / (playing["dtype"]+"_"+ah+".jpg")
+                        if not af.exists():
+                            try:
+                                with Image.open(BytesIO(playing["artwork"])) as _art: _art.save(af, "JPEG")
+                            except Exception: pass  # bad artwork bytes — skip art, still show track info
+                        if af.exists(): ap = str(af)
+                    final = {"track": playing["title"], "artist": playing["artist"],
+                             "image_url": ap, "source": playing["dtype"], "is_local_file": True}
+                else:
+                    final = None
+                with self._lock:
+                    self._result = final
+                    self._result_time = time.time()
+            except Exception as e:
+                print(f"[HomePod] Poll loop error: {type(e).__name__}: {e}")
+                with self._lock:
+                    self._result = None
+                    self._result_time = time.time()
             await asyncio.sleep(HOMEPOD_POLL_INTERVAL)
 
     def get_playing(self):
         with self._lock:
+            if self._result and (time.time() - self._result_time) > (HOMEPOD_POLL_INTERVAL * 3):
+                return None
             return self._result
 
 class SpotifyClient:
@@ -689,7 +699,7 @@ class SpotifyClient:
             r = _session.get("https://api.spotify.com/v1/me/player/currently-playing",
                 headers={"Authorization":"Bearer "+self.access_token}, timeout=4)
             if r.status_code == 429:
-                retry_after = int(r.headers.get("Retry-After", "30"))
+                retry_after = min(int(r.headers.get("Retry-After", "30")), 300)
                 self.backoff_until = time.time() + retry_after
                 print("Spotify 429: backing off " + str(retry_after) + "s")
                 return None
@@ -956,7 +966,10 @@ class ISSTracker:
         self.lat = None; self.lon = None
         self.distance = None; self.last_distance = None
         self.last_poll_time = 0
+        self.retry_after = 0
     def poll(self):
+        if time.time() < self.retry_after:
+            return False
         try:
             r = _session.get("http://api.open-notify.org/iss-now.json", timeout=5)
             r.raise_for_status()
@@ -965,9 +978,12 @@ class ISSTracker:
             self.last_distance = self.distance
             self.distance = haversine_miles(CHATTANOOGA_LAT, CHATTANOOGA_LON, self.lat, self.lon)
             self.last_poll_time = time.time()
+            self.retry_after = 0
             return True
         except Exception as e:
-            print("ISS error: "+str(e)); return False
+            print("ISS error: "+str(e))
+            self.retry_after = time.time() + 120
+            return False
     def is_fresh(self):
         return time.time() - self.last_poll_time < 120  # stale after 2 min
     def just_became_overhead(self):
@@ -1024,14 +1040,14 @@ class FlightTracker:
             for k in stale: del self.positions[k]
     def _poll_adsblol(self):
         try:
-            r = _session.get("https://api.adsb.lol/v2/lat/"+str(CHATTANOOGA_LAT)+"/lon/"+str(CHATTANOOGA_LON)+"/dist/25", timeout=8)
+            r = _session.get("https://api.adsb.lol/v2/lat/"+str(CHATTANOOGA_LAT)+"/lon/"+str(CHATTANOOGA_LON)+"/dist/"+str(RADIUS_MILES), timeout=8)
             r.raise_for_status()
             return self._parse(r.json().get("ac") or [])
         except Exception as e:
             print("adsb.lol err: "+str(e)); return []
     def _poll_airplaneslive(self):
         try:
-            r = _session.get("https://api.airplanes.live/v2/point/"+str(CHATTANOOGA_LAT)+"/"+str(CHATTANOOGA_LON)+"/25", timeout=8)
+            r = _session.get("https://api.airplanes.live/v2/point/"+str(CHATTANOOGA_LAT)+"/"+str(CHATTANOOGA_LON)+"/"+str(RADIUS_MILES), timeout=8)
             r.raise_for_status()
             return self._parse(r.json().get("ac") or [])
         except Exception as e:
@@ -1041,7 +1057,7 @@ class FlightTracker:
         # opendata.adsb.fi, which returns the aircraft list under "aircraft"
         # instead of "ac" (the per-aircraft fields are otherwise identical).
         try:
-            r = _session.get("https://opendata.adsb.fi/api/v2/lat/"+str(CHATTANOOGA_LAT)+"/lon/"+str(CHATTANOOGA_LON)+"/dist/25", timeout=8)
+            r = _session.get("https://opendata.adsb.fi/api/v2/lat/"+str(CHATTANOOGA_LAT)+"/lon/"+str(CHATTANOOGA_LON)+"/dist/"+str(RADIUS_MILES), timeout=8)
             r.raise_for_status()
             data = r.json()
             return self._parse(data.get("aircraft") or data.get("ac") or [])
@@ -2450,9 +2466,11 @@ def display_image_file(path):
     global _file_cache_path, _file_cache_img
     try:
         if path != _file_cache_path:
+            _file_cache_img = None
+            with Image.open(path) as _raw:
+                _file_cache_img = _raw.convert("RGB").copy()
             _file_cache_path = path
-            _file_cache_img = Image.open(path).copy()
-        display_pil_image(_file_cache_img)
+        display_pil_image(_file_cache_img, photo=True)
     except Exception as e:
         print("Display error ("+str(path)+"): "+str(e))
         _file_cache_path = None
@@ -2682,6 +2700,8 @@ def main():
     last_sp_key = None           # detect Spotify song changes
     last_hp_key = None           # detect HomePod song changes
     in_interrupt = False
+    _resume_from_interrupt = False  # set when an interrupt ends, so the resuming
+                                    # slide fades back in instead of popping
     _manual_box = [None]           # [plane_dict] for background global fetch
     manual_plane_fetch_time = 0
     manual_search_start = 0
@@ -2700,6 +2720,7 @@ def main():
     last_forced_photo = None
     last_planes = []
     last_status_write = 0
+    last_cache_cleanup = time.time()
 
     cleanup_art_cache()
     # Ensure status file exists and is world-readable for the web server
@@ -2913,6 +2934,10 @@ def main():
                 if now - last_status_write >= 5:
                     last_status_write = now
                     _write_status(current_spotify or current_homepod, last_planes, flights, iss, cached_weather)
+
+                if now - last_cache_cleanup >= 3600:
+                    last_cache_cleanup = now
+                    cleanup_art_cache()
 
                 # ─────────────────────────────────────────────────────────────────────────
                 # Check for user overrides from the web dashboard
@@ -3278,7 +3303,7 @@ def main():
 
                 # Track art paths — update when song changes
                 if current_spotify:
-                    sk = (current_spotify.get("track","")) + "|" + (current_spotify.get("artist",""))
+                    sk = current_spotify.get("track","").strip() + "|" + current_spotify.get("artist","").strip()
                     if sk != last_sp_key:
                         last_sp_key = sk
                         print("SP: "+current_spotify.get("track","?")+" - "+current_spotify.get("artist","?"))
@@ -3288,7 +3313,7 @@ def main():
                     last_sp_key = None; current_sp_art_path = None
 
                 if current_homepod:
-                    hk = (current_homepod.get("track","")) + "|" + (current_homepod.get("artist",""))
+                    hk = current_homepod.get("track","").strip() + "|" + current_homepod.get("artist","").strip()
                     if hk != last_hp_key:
                         last_hp_key = hk
                         print("HP: "+current_homepod.get("track","?")+" - "+current_homepod.get("artist","?"))
@@ -3331,6 +3356,7 @@ def main():
                     in_interrupt = False
                     last_render = 0
                     last_clock_tick = 0
+                    _resume_from_interrupt = True   # fade the resuming slide back in
 
                 anim_frame = int(now * 2)  # 2 ticks/sec, time-based so interrupts don't slow it
 
@@ -3350,7 +3376,11 @@ def main():
                 if now - slot_start >= cur_slot_dur:
                     cur_pos   = active_slots.index(SLOTS[slot_idx]) if SLOTS[slot_idx] in active_slots else 0
                     next_slot = active_slots[(cur_pos + 1) % len(active_slots)]
-                    # Pre-render the incoming slide so the fade goes slide→slide, not slide→black
+                    # Pre-render the incoming slide so the fade ALWAYS goes
+                    # slide→slide (never slide→black→pop). Photos are picked and
+                    # loaded here too so they cross-fade in like every other slide.
+                    _next_img = None
+                    _next_photo_path = None
                     try:
                         if next_slot == "clock":
                             _next_img = render_clock()
@@ -3358,17 +3388,52 @@ def main():
                             _next_img = render_weather(cached_weather, cached_aqi, anim_frame)
                         elif next_slot == "sun":
                             _next_img = render_sun(cached_sun, cached_weather)
-                        else:
-                            _next_img = None   # photos vary; fade to black is fine
+                        elif next_slot == "photos":
+                            _next_photo_path = pick_photo(last_forced_photo)
+                            if _next_photo_path:
+                                _ps = _load_photo_settings()
+                                _next_img = zoom_to_fill_64(
+                                    Image.open(_next_photo_path),
+                                    _ps.get(os.path.basename(_next_photo_path)))
                     except Exception:
                         _next_img = None
+                        _next_photo_path = None
                     do_transition(_next_img)
+                    _resume_from_interrupt = False   # the slot-change fade covers it
                     slot_idx   = SLOTS.index(next_slot)
                     slot_start = now
                     last_render = 0
                     last_clock_tick = 0
-                    current_photo_path = None
+                    # Carry the pre-picked photo through so the photos branch shows
+                    # exactly what we just faded to (no re-pick, no second flash).
+                    current_photo_path = _next_photo_path
                 cs_slot = SLOTS[slot_idx]
+
+                # Returning from an interrupt (flight/ISS/music) WITHOUT a slot
+                # change: fade the resuming slide back in instead of popping it.
+                # (If the slot changed above, that fade already ran and cleared
+                # this flag.) The plane interrupt has its own animation and is
+                # handled before this point, so it is never faded here.
+                if _resume_from_interrupt and last_render == 0:
+                    _resume_from_interrupt = False
+                    try:
+                        if cs_slot == "clock":
+                            _rimg = render_clock()
+                        elif cs_slot == "weather":
+                            _rimg = render_weather(cached_weather, cached_aqi, anim_frame)
+                        elif cs_slot == "sun":
+                            _rimg = render_sun(cached_sun, cached_weather)
+                        elif cs_slot == "photos" and current_photo_path:
+                            _ps = _load_photo_settings()
+                            _rimg = zoom_to_fill_64(
+                                Image.open(current_photo_path),
+                                _ps.get(os.path.basename(current_photo_path)))
+                        else:
+                            _rimg = None
+                    except Exception:
+                        _rimg = None
+                    if _rimg is not None:
+                        do_transition(_rimg)
 
                 if cs_slot == "clock":
                     if now - last_clock_tick >= CLOCK_REFRESH_INTERVAL:
