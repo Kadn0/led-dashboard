@@ -13,6 +13,7 @@ from dashboard_config import (
     MANUAL_TRACK_FILE, OVERRIDE_FILE, STATUS_FILE,
     PHOTO_SETTINGS_FILE, BRIGHT_SCHEDULE_FILE, PID_FILE,
     DEFAULT_BRIGHT_SCHEDULE as _DEFAULT_SCHEDULE,
+    CLOCK_SETTINGS_FILE, CLOCK_TIMEZONES,
 )
 
 app = Flask(__name__)
@@ -45,6 +46,51 @@ def get_bright_schedule():
     except Exception:
         pass
     return {"segments": list(_DEFAULT_SEGMENTS)}
+
+# ── Clock settings (single Eastern vs 4-zone grid) ───────────────────────
+_DEFAULT_CLOCK_ZONES = [[l, tz] for (l, tz, _c) in CLOCK_TIMEZONES][:4]
+# Curated picker list: (display name, short on-screen label, IANA tz).
+# The short label is what shows in the 32px grid cell.
+CLOCK_TZ_OPTIONS = [
+    ("Eastern (New York)", "EST", "America/New_York"),
+    ("Central (Chicago)",  "CST", "America/Chicago"),
+    ("Mountain (Denver)",  "MST", "America/Denver"),
+    ("Pacific (Los Angeles)", "PST", "America/Los_Angeles"),
+    ("Alaska (Anchorage)", "AK",  "America/Anchorage"),
+    ("Hawaii (Honolulu)",  "HI",  "Pacific/Honolulu"),
+    ("UTC",                "UTC", "UTC"),
+    ("London",             "LON", "Europe/London"),
+    ("Paris",              "PAR", "Europe/Paris"),
+    ("Berlin",             "BER", "Europe/Berlin"),
+    ("Moscow",             "MOW", "Europe/Moscow"),
+    ("Dubai",              "DXB", "Asia/Dubai"),
+    ("India (Kolkata)",    "IND", "Asia/Kolkata"),
+    ("China (Shanghai)",   "CHN", "Asia/Shanghai"),
+    ("Tokyo",              "TYO", "Asia/Tokyo"),
+    ("Sydney",             "SYD", "Australia/Sydney"),
+    ("Sao Paulo",          "SAO", "America/Sao_Paulo"),
+    ("Mexico City",        "MEX", "America/Mexico_City"),
+]
+_VALID_TZS = {tz for (_n, _l, tz) in CLOCK_TZ_OPTIONS}
+
+def get_clock_settings():
+    """Returns {"mode": "single"|"quad", "zones": [[label, tz], ...4]}."""
+    result = {"mode": "single", "zones": [list(z) for z in _DEFAULT_CLOCK_ZONES]}
+    try:
+        if os.path.exists(CLOCK_SETTINGS_FILE):
+            data = json.loads(open(CLOCK_SETTINGS_FILE).read())
+            if data.get("mode") in ("single", "quad"):
+                result["mode"] = data["mode"]
+            z = data.get("zones")
+            if isinstance(z, list) and z:
+                zones = [[str(e[0])[:4], str(e[1])] for e in z[:4]
+                         if isinstance(e, (list, tuple)) and len(e) >= 2]
+                if zones:
+                    result["zones"] = zones
+    except Exception:
+        pass
+    return result
+
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic"}
 ART_PREFIXES      = ("homepod_", "spotify_", "album_", "art_")
 
@@ -283,6 +329,8 @@ button:active { transform:scale(.96); opacity:.8; }
 .btn-success { background:rgba(0,255,136,.08); color:var(--green); border-color:rgba(0,255,136,.25); }
 .btn-ghost   { background:var(--surface); color:var(--text); border-color:var(--border); }
 .btn-active  { background:rgba(34,136,255,.18)!important; color:var(--cyan)!important; border-color:var(--cyan)!important; box-shadow:inset 0 0 8px rgba(0,204,255,.06)!important; }
+.btn-ghost.active { background:rgba(34,136,255,.18); color:var(--cyan); border-color:var(--cyan); box-shadow:inset 0 0 8px rgba(0,204,255,.06); }
+.clk-tz { background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:5px; padding:8px; font-size:12px; font-family:inherit; width:100%; }
 .btn-icon    { width:auto; padding:7px 10px; font-size:13px; border-radius:5px; }
 .row { display:flex; gap:6px; flex-wrap:wrap; }
 .row button { flex:1; min-width:60px; }
@@ -592,6 +640,27 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
   <div class="card">
     <div id="schedTimeline" style="margin-bottom:14px"></div>
     <div id="schedSliders"></div>
+  </div>
+</div>
+
+<!-- Clock Style -->
+<div class="section">
+  <div class="section-title">// Clock Style</div>
+  <div class="card">
+    <div class="row" style="gap:8px;margin-bottom:14px">
+      <button class="btn-ghost" id="clkModeSingle" onclick="setClockMode('single')" style="flex:1">Single — Eastern</button>
+      <button class="btn-ghost" id="clkModeQuad" onclick="setClockMode('quad')" style="flex:1">4 Time Zones</button>
+    </div>
+    <div id="clkZones" style="display:none">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:8px;letter-spacing:1px">PICK FOUR ZONES (top-left, top-right, bottom-left, bottom-right)</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+        <select class="clk-tz" id="clkTz0"></select>
+        <select class="clk-tz" id="clkTz1"></select>
+        <select class="clk-tz" id="clkTz2"></select>
+        <select class="clk-tz" id="clkTz3"></select>
+      </div>
+      <button class="btn-primary" onclick="saveClockZones()" style="margin-top:12px;width:100%">Save Time Zones</button>
+    </div>
   </div>
 </div>
 
@@ -1764,8 +1833,69 @@ async function restartService(which) {
   }
 }
 
+// ── Clock style (single Eastern vs 4 zones) ──────────────────────────────
+let clockOptions = [];     // [[name, label, tz], ...]
+let clockMode = 'single';
+let clockZones = [];       // [[label, tz], ...4]
+
+async function loadClockSettings() {
+  try {
+    const r = await fetch('/api/clock_settings');
+    const d = await r.json();
+    clockOptions = d.options || [];
+    clockMode = d.mode || 'single';
+    clockZones = d.zones || [];
+    // Populate the four dropdowns from the option list
+    for (let i = 0; i < 4; i++) {
+      const sel = document.getElementById('clkTz' + i);
+      if (!sel) continue;
+      sel.innerHTML = clockOptions.map(o =>
+        `<option value="${o[1]}|${o[2]}">${o[0]}</option>`).join('');
+      const z = clockZones[i];
+      if (z) sel.value = z[0] + '|' + z[1];
+    }
+    renderClockMode();
+  } catch (e) {}
+}
+
+function renderClockMode() {
+  const single = document.getElementById('clkModeSingle');
+  const quad = document.getElementById('clkModeQuad');
+  const zones = document.getElementById('clkZones');
+  if (single) single.classList.toggle('active', clockMode === 'single');
+  if (quad) quad.classList.toggle('active', clockMode === 'quad');
+  if (zones) zones.style.display = (clockMode === 'quad') ? 'block' : 'none';
+}
+
+function _collectClockZones() {
+  const out = [];
+  for (let i = 0; i < 4; i++) {
+    const sel = document.getElementById('clkTz' + i);
+    const [label, tz] = (sel ? sel.value : '|').split('|');
+    out.push([label, tz]);
+  }
+  return out;
+}
+
+async function _saveClock() {
+  await fetch('/api/clock_settings', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({mode: clockMode, zones: _collectClockZones()})});
+}
+
+async function setClockMode(mode) {
+  clockMode = mode;
+  renderClockMode();
+  await _saveClock();
+  showToast(mode === 'single' ? 'Clock: single Eastern' : 'Clock: 4 time zones');
+}
+
+async function saveClockZones() {
+  await _saveClock();
+  showToast('Time zones saved');
+}
+
 // Init
-pollOverride(); pollFlight(); loadPhotos(); loadStatus(); pollLiveData(); loadPhotoSettings(); loadSchedule();
+pollOverride(); pollFlight(); loadPhotos(); loadStatus(); pollLiveData(); loadPhotoSettings(); loadSchedule(); loadClockSettings();
 initRadarMap();
 setInterval(pollOverride, 3000);
 setInterval(pollFlight, 2000);
@@ -1995,6 +2125,35 @@ def api_bright_schedule():
             json.dump({**_DEFAULT_SCHEDULE, **sched}, f)
         return ('', 204)
     return jsonify(get_bright_schedule())
+
+@app.route("/api/clock_settings", methods=["GET", "POST"])
+@login_required
+def api_clock_settings():
+    if request.method == "POST":
+        data = request.get_json(force=True) or {}
+        mode = data.get("mode")
+        if mode not in ("single", "quad"):
+            return ('', 400)
+        out = {"mode": mode}
+        # Validate the 4 zones against the known timezone list; fall back to the
+        # default for any slot that's missing or unrecognised.
+        zones_in = data.get("zones") or []
+        zones = []
+        for i in range(4):
+            try:
+                lbl, tz = str(zones_in[i][0])[:4], str(zones_in[i][1])
+            except Exception:
+                lbl, tz = _DEFAULT_CLOCK_ZONES[i]
+            if tz not in _VALID_TZS:
+                lbl, tz = _DEFAULT_CLOCK_ZONES[i]
+            zones.append([lbl, tz])
+        out["zones"] = zones
+        tmp = CLOCK_SETTINGS_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(out, f)
+        os.replace(tmp, CLOCK_SETTINGS_FILE)
+        return ('', 204)
+    return jsonify({**get_clock_settings(), "options": CLOCK_TZ_OPTIONS})
 
 @app.route("/api/brightness", methods=["POST"])
 @login_required

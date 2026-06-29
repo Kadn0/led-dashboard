@@ -105,6 +105,7 @@ from dashboard_config import (
     CACHE_DIR  as _CACHE_DIR_STR,
     MANUAL_TRACK_FILE, STATUS_FILE, OVERRIDE_FILE, BRIGHT_SCHEDULE_FILE, PID_FILE,
     PHOTO_SETTINGS_FILE as _PHOTO_SETTINGS_FILE_STR,
+    CLOCK_SETTINGS_FILE,
 )
 
 _PID_FILE = PID_FILE
@@ -1309,12 +1310,108 @@ def draw_small_weather_icon(draw, cx, cy, code, frame=0):
         draw.ellipse([(cx-4,cy-4),(cx+4,cy+4)], fill=(255,220,0))
 
 # ========== RENDERERS ==========
-def render_clock():
-    img = Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT),(0,0,0))
+# ── Clock settings (web-toggleable) ──────────────────────────────────────
+# Default zones come from the config CLOCK_TIMEZONES (label, tz, color) tuples.
+_DEFAULT_CLOCK_ZONES = [(l, tz) for (l, tz, _c) in CLOCK_TIMEZONES][:4]
+# Fixed per-slot colours for the 4-zone grid (slot order = top-left, top-right,
+# bottom-left, bottom-right). Keeps the look stable regardless of which zones
+# the user picks on the web page.
+_CLOCK_SLOT_COLORS = [(255,255,100), (200,255,200), (180,220,255), (255,150,200)]
+SINGLE_CLOCK_TZ = "America/New_York"   # Eastern, used by the single-zone mode
+
+_clock_settings_cache = None
+_clock_settings_cache_time = 0.0
+def _load_clock_settings():
+    """Returns {"mode": "single"|"quad", "zones": [(label, tz), ...]}.
+    Cached 2s so the per-second clock render doesn't re-read disk every frame."""
+    global _clock_settings_cache, _clock_settings_cache_time
+    if _clock_settings_cache is not None and time.time() - _clock_settings_cache_time < 2.0:
+        return _clock_settings_cache
+    result = {"mode": "single", "zones": list(_DEFAULT_CLOCK_ZONES)}
+    try:
+        if os.path.exists(CLOCK_SETTINGS_FILE):
+            data = json.loads(open(CLOCK_SETTINGS_FILE).read())
+            if data.get("mode") in ("single", "quad"):
+                result["mode"] = data["mode"]
+            z = data.get("zones")
+            if isinstance(z, list) and z:
+                zones = [(str(e[0]), str(e[1])) for e in z[:4]
+                         if isinstance(e, (list, tuple)) and len(e) >= 2]
+                if zones:
+                    result["zones"] = zones
+    except Exception:
+        pass  # any read/parse error → safe defaults
+    _clock_settings_cache = result
+    _clock_settings_cache_time = time.time()
+    return result
+
+def _perimeter_points(W, H):
+    """Ordered list of border pixels, clockwise from the top-left corner."""
+    pts = []
+    for x in range(W):            pts.append((x, 0))        # top:    L → R
+    for y in range(1, H):         pts.append((W-1, y))      # right:  T → B
+    for x in range(W-2, -1, -1):  pts.append((x, H-1))      # bottom: R → L
+    for y in range(H-2, 0, -1):   pts.append((0, y))        # left:   B → T
+    return pts
+
+# Cache the two perimeter rings (outer edge + 1px inset) so the border bar is
+# a crisp 2px-thick ring without recomputing the path every frame.
+_PERIM_RINGS = None
+
+def _best_clock_font(draw, text, max_w, sizes=(22, 20, 18, 16, 14)):
+    """Largest font from `sizes` whose rendered width fits within max_w."""
+    for s in sizes:
+        f = get_font(s)
+        bb = draw.textbbox((0, 0), text, font=f)
+        if bb[2] - bb[0] <= max_w:
+            return f
+    return get_font(sizes[-1])
+
+def render_clock_single():
+    """Big bold Eastern HH:MM centred, with a border bar that fills once per
+    minute to reflect the seconds (like a second hand sweeping the frame)."""
+    img = Image.new("RGB", (MATRIX_WIDTH, MATRIX_HEIGHT), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    try:
+        dt = datetime.now(ZoneInfo(SINGLE_CLOCK_TZ))
+    except Exception:
+        dt = datetime.now()
+    h12  = dt.hour % 12 or 12
+    tstr = str(h12) + ":" + ("%02d" % dt.minute)
+    ampm = "AM" if dt.hour < 12 else "PM"
+    frac = (dt.second + dt.microsecond / 1e6) / 60.0   # 0..1 around the minute
+
+    # ── Seconds border bar: dim full ring, bright fill up to `frac`, 2px thick ──
+    global _PERIM_RINGS
+    if _PERIM_RINGS is None:
+        outer = _perimeter_points(MATRIX_WIDTH, MATRIX_HEIGHT)
+        inner = [(x + 1, y + 1) for (x, y) in _perimeter_points(MATRIX_WIDTH - 2, MATRIX_HEIGHT - 2)]
+        _PERIM_RINGS = (outer, inner)
+    bar_col, dim_col = (0, 180, 255), (22, 32, 48)
+    for ring in _PERIM_RINGS:
+        for (x, y) in ring:
+            draw.point((x, y), fill=dim_col)
+        lit = int(frac * len(ring))
+        for i in range(lit):
+            draw.point(ring[i], fill=bar_col)
+
+    # ── Big bold time, centred ──
+    f = _best_clock_font(draw, tstr, MATRIX_WIDTH - 8)
+    draw.text((MATRIX_WIDTH // 2, MATRIX_HEIGHT // 2 - 3), tstr,
+              font=f, fill=(255, 255, 255), anchor="mm")
+    # Small AM/PM beneath so 9am/9pm aren't ambiguous (kept subtle).
+    draw.text((MATRIX_WIDTH // 2, MATRIX_HEIGHT // 2 + 13), ampm,
+              font=get_font(7), fill=(110, 140, 180), anchor="mm")
+    return img
+
+def render_clock_quad(zones):
+    """The classic 2×2 grid showing up to four time zones."""
+    img = Image.new("RGB", (MATRIX_WIDTH, MATRIX_HEIGHT), (0, 0, 0))
     draw = ImageDraw.Draw(img)
     lf = get_font(7); tf = get_font(9); sf = get_font(7)
-    for i,(label,tz,color) in enumerate(CLOCK_TIMEZONES):
-        col = i%2; row = i//2
+    for i, (label, tz) in enumerate((zones or _DEFAULT_CLOCK_ZONES)[:4]):
+        color = _CLOCK_SLOT_COLORS[i]
+        col = i % 2; row = i // 2
         x = col*32 + 1; y = row*32
         try:
             dt = datetime.now(ZoneInfo(tz))
@@ -1331,6 +1428,14 @@ def render_clock():
     draw.line([(32,0),(32,63)], fill=(40,40,60))
     draw.line([(0,32),(63,32)], fill=(40,40,60))
     return img
+
+def render_clock():
+    """Dispatch to the single-zone (Eastern + seconds bar) or 4-zone grid based
+    on the web-controlled clock setting."""
+    s = _load_clock_settings()
+    if s.get("mode") == "quad":
+        return render_clock_quad(s.get("zones"))
+    return render_clock_single()
 
 def render_weather(weather, aqi_data=None, frame=0):
     img = Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT),(0,0,0))

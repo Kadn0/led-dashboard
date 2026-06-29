@@ -107,4 +107,5 @@ OVERRIDE_FILE        = _os.path.join(_HOME, "dashboard_override.json")
 STATUS_FILE          = _os.path.join(_HOME, "dashboard_status.json")
 PHOTO_SETTINGS_FILE  = _os.path.join(_HOME, "dashboard_photo_settings.json")
 BRIGHT_SCHEDULE_FILE = _os.path.join(_HOME, "dashboard_bright_schedule.json")
+CLOCK_SETTINGS_FILE  = _os.path.join(_HOME, "dashboard_clock_settings.json")
 PID_FILE             = "/tmp/dashboard.pid"
