@@ -82,7 +82,7 @@ def get_clock_settings():
     try:
         if os.path.exists(CLOCK_SETTINGS_FILE):
             data = json.loads(open(CLOCK_SETTINGS_FILE).read())
-            if data.get("mode") in ("single", "quad", "analog"):
+            if data.get("mode") in ("single", "quad", "analog", "rings"):
                 result["mode"] = data["mode"]
             z = data.get("zones")
             if isinstance(z, list) and z:
@@ -793,10 +793,11 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
 <div class="section">
   <div class="section-title">// Clock Style</div>
   <div class="card">
-    <div class="row" style="gap:8px;margin-bottom:14px">
-      <button class="btn-ghost" id="clkModeSingle" onclick="setClockMode('single')" style="flex:1">Digital</button>
-      <button class="btn-ghost" id="clkModeAnalog" onclick="setClockMode('analog')" style="flex:1">Analog</button>
-      <button class="btn-ghost" id="clkModeQuad" onclick="setClockMode('quad')" style="flex:1">4 Zones</button>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px">
+      <button class="btn-ghost" id="clkModeSingle" onclick="setClockMode('single')">Digital</button>
+      <button class="btn-ghost" id="clkModeAnalog" onclick="setClockMode('analog')">Analog</button>
+      <button class="btn-ghost" id="clkModeRings" onclick="setClockMode('rings')">Rings</button>
+      <button class="btn-ghost" id="clkModeQuad" onclick="setClockMode('quad')">4 Zones</button>
     </div>
 
     <!-- Single / Analog styling (colour + date) -->
@@ -1972,7 +1973,7 @@ function renderClockSwatches() {
 }
 
 function renderClockMode() {
-  ['single','analog','quad'].forEach(m => {
+  ['single','analog','rings','quad'].forEach(m => {
     const el = document.getElementById('clkMode' + m.charAt(0).toUpperCase() + m.slice(1));
     if (el) el.classList.toggle('active', clockMode === m);
   });
@@ -2004,7 +2005,8 @@ async function setClockMode(mode) {
   clockMode = mode;
   renderClockMode();
   await _saveClock();
-  showToast(mode==='single' ? 'Clock: digital' : mode==='analog' ? 'Clock: analog' : 'Clock: 4 time zones');
+  showToast(mode==='single' ? 'Clock: digital' : mode==='analog' ? 'Clock: analog'
+            : mode==='rings' ? 'Clock: activity rings' : 'Clock: 4 time zones');
 }
 
 async function onClockColor(hex) {
@@ -2349,7 +2351,7 @@ def api_clock_settings():
     if request.method == "POST":
         data = request.get_json(force=True) or {}
         mode = data.get("mode")
-        if mode not in ("single", "quad", "analog"):
+        if mode not in ("single", "quad", "analog", "rings"):
             return ('', 400)
         out = {"mode": mode}
         # Validate the 4 zones against the known timezone list; fall back to the

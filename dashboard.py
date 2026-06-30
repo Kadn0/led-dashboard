@@ -1416,7 +1416,7 @@ def _load_clock_settings():
     try:
         if os.path.exists(CLOCK_SETTINGS_FILE):
             data = json.loads(open(CLOCK_SETTINGS_FILE).read())
-            if data.get("mode") in ("single", "quad", "analog"):
+            if data.get("mode") in ("single", "quad", "analog", "rings"):
                 result["mode"] = data["mode"]
             z = data.get("zones")
             if isinstance(z, list) and z:
@@ -1544,6 +1544,14 @@ def render_clock_analog(s=None):
         draw.line([(cx + sinA * r_in, cy - cosA * r_in),
                    (cx + sinA * R,    cy - cosA * R)], fill=col, width=1)
 
+    # ── California-style numerals at 12 / 3 / 6 / 9 ──
+    nf = get_font(8)
+    for num, frac in (("12", 0.0), ("3", 0.25), ("6", 0.5), ("9", 0.75)):
+        ang = frac * 2 * math.pi
+        nx = cx + math.sin(ang) * (R - 9)
+        ny = cy - math.cos(ang) * (R - 9)
+        draw.text((nx, ny), num, font=nf, fill=_scale(accent, 0.9), anchor="mm")
+
     sec  = dt.second + dt.microsecond / 1e6
     mins = dt.minute + sec / 60.0
     hrs  = (dt.hour % 12) + mins / 60.0
@@ -1564,6 +1572,52 @@ def render_clock_analog(s=None):
     if bool(s.get("show_date")):
         draw.text((cx, H - 5), _clk_date_str(dt), font=get_font(6),
                   fill=_scale(accent, 0.85), anchor="mm")
+    return img
+
+# Apple-Watch "Activity" ring colours (move / exercise / stand).
+_RING_MOVE     = (250, 30, 90)
+_RING_EXERCISE = (150, 230, 50)
+_RING_STAND    = (30, 220, 210)
+
+def render_clock_rings(s=None):
+    """Apple-Watch 'Activity' style: three concentric rings sweep smoothly around
+    a digital time. Outer ring = seconds (sweeps every minute), middle = minutes,
+    inner = hours. The centre time uses the configurable accent colour."""
+    s = s or {}
+    img = Image.new("RGB", (MATRIX_WIDTH, MATRIX_HEIGHT), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    try:
+        dt = datetime.now(ZoneInfo(_single_clock_tz()))
+    except Exception:
+        dt = datetime.now()
+
+    W, H = MATRIX_WIDTH, MATRIX_HEIGHT
+    cx, cy = W / 2.0, H / 2.0
+    accent = _clk_accent(s)
+
+    sec  = dt.second + dt.microsecond / 1e6
+    mins = dt.minute + sec / 60.0
+    hr12 = (dt.hour % 12) + mins / 60.0
+
+    rings = [
+        (30, _RING_MOVE,     sec / 60.0),    # outer  — seconds (fast, smooth)
+        (25, _RING_EXERCISE, mins / 60.0),   # middle — minutes
+        (20, _RING_STAND,    hr12 / 12.0),   # inner  — hours
+    ]
+    for r, col, frac in rings:
+        bbox = [cx - r, cy - r, cx + r, cy + r]
+        draw.arc(bbox, 0, 360, fill=_scale(col, 0.16), width=3)        # dim full track
+        if frac > 0:
+            draw.arc(bbox, -90, -90 + frac * 360.0, fill=col, width=3)  # bright sweep
+
+    h12  = dt.hour % 12 or 12
+    tstr = f"{h12}:{dt.minute:02d}"
+    show_date = bool(s.get("show_date"))
+    f = _best_clock_font(draw, tstr, 28, sizes=(13, 12, 11, 10, 9))
+    draw.text((cx, cy - (3 if show_date else 0)), tstr, font=f, fill=accent, anchor="mm")
+    if show_date:
+        draw.text((cx, cy + 8), f"{dt.month}/{dt.day}", font=get_font(6),
+                  fill=_scale(accent, 0.8), anchor="mm")
     return img
 
 def render_clock_quad(zones):
@@ -1600,6 +1654,8 @@ def render_clock():
         return render_clock_quad(s.get("zones"))
     if mode == "analog":
         return render_clock_analog(s)
+    if mode == "rings":
+        return render_clock_rings(s)
     return render_clock_single(s)
 
 def clock_is_single():
