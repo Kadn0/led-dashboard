@@ -15,6 +15,7 @@ from dashboard_config import (
     DEFAULT_BRIGHT_SCHEDULE as _DEFAULT_SCHEDULE,
     CLOCK_SETTINGS_FILE, CLOCK_TIMEZONES,
 )
+import dashboard_config as _cfg   # first-run setup state (load/save/effective_*)
 
 app = Flask(__name__)
 app.secret_key = "cf82a1d9e4b7f305c6182a3d"
@@ -2019,8 +2020,11 @@ _TMPL_VARS = dict(title=WEB_TITLE, location_lat=LOCATION_LAT, location_lon=LOCAT
 
 @app.route("/login", methods=["GET","POST"])
 def login():
+    # Before first-run setup there is no password to enter yet — send them to the wizard.
+    if not _cfg.setup_is_complete():
+        return redirect("/setup")
     if request.method == "POST":
-        if request.form.get("password") == PASSWORD:
+        if request.form.get("password") == _cfg.effective_web_password():
             session["authed"] = True; return redirect("/")
         return render_template_string(LOGIN_HTML, error=True, **_TMPL_VARS)
     if session.get("authed"): return redirect("/")
@@ -2033,6 +2037,9 @@ def logout():
 @app.route("/")
 @login_required
 def index():
+    # Brand-new install: send the user through the first-run wizard instead.
+    if not _cfg.setup_is_complete():
+        return redirect("/setup")
     return render_template_string(HTML, **_TMPL_VARS)
 
 @app.route("/track", methods=["POST"])
@@ -2592,6 +2599,304 @@ def spotify_callback():
             error=f"Could not save config: {e}", **_TMPL_VARS)
 
     return render_template_string(_SPOTIFY_SUCCESS_HTML, **_TMPL_VARS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIRST-RUN SETUP WIZARD  (location → password → optional Spotify)
+# Reachable WITHOUT the dashboard password, because a brand-new user hasn't set
+# one yet. The matrix shows a QR pointing here on first boot; once finished, the
+# choice is cached in ~/.dashboard_setup.json and this flow never appears again.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _geocode_search(q, count=6):
+    """City-name search via Open-Meteo's free geocoding API → list of candidates."""
+    try:
+        r = _req.get("https://geocoding-api.open-meteo.com/v1/search",
+                     params={"name": q, "count": count, "language": "en", "format": "json"},
+                     timeout=6)
+        r.raise_for_status()
+        out = []
+        for res in (r.json().get("results") or []):
+            parts = [res.get("name"), res.get("admin1"), res.get("country_code")]
+            out.append({
+                "name": ", ".join(p for p in parts if p),
+                "lat":  res.get("latitude"),
+                "lon":  res.get("longitude"),
+                "tz":   res.get("timezone") or "UTC",
+            })
+        return out
+    except Exception:
+        return []
+
+
+def _ip_location():
+    """Approximate location from the Pi's public IP — used only to pre-fill the wizard."""
+    try:
+        r = _req.get("http://ip-api.com/json"
+                     "?fields=status,city,regionName,country,lat,lon,timezone", timeout=5)
+        d = r.json()
+        if d.get("status") == "success":
+            parts = [d.get("city"), d.get("regionName"), d.get("country")]
+            return {"name": ", ".join(p for p in parts if p),
+                    "lat": d.get("lat"), "lon": d.get("lon"),
+                    "tz": d.get("timezone") or "UTC"}
+    except Exception:
+        pass
+    return None
+
+
+def _valid_tz(tz):
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(str(tz))
+        return True
+    except Exception:
+        return False
+
+
+@app.route("/setup")
+def setup_wizard():
+    # Already configured? Don't let the wizard clobber a live install.
+    if _cfg.setup_is_complete():
+        return redirect("/")
+    saved = _cfg.load_setup()
+    loc   = saved.get("location") or {}
+    spotify_connected = False
+    if _SPOTIFY_CONF.exists():
+        try:
+            spotify_connected = bool(json.loads(_SPOTIFY_CONF.read_text()).get("refresh_token"))
+        except Exception:
+            pass
+    ip_guess = _ip_location() or {}
+    return render_template_string(
+        _SETUP_HTML,
+        title=WEB_TITLE,
+        spotify_connected=spotify_connected,
+        prefill_name=loc.get("name", ""),
+        prefill_lat=loc.get("lat", ""),
+        prefill_lon=loc.get("lon", ""),
+        prefill_tz=loc.get("tz", ""),
+        ip_name=ip_guess.get("name", ""),
+        ip_lat=ip_guess.get("lat", ""),
+        ip_lon=ip_guess.get("lon", ""),
+        ip_tz=ip_guess.get("tz", ""),
+        has_location=bool(loc.get("lat") is not None and loc.get("lat") != ""),
+    )
+
+
+@app.route("/setup/geocode")
+def setup_geocode():
+    q = (request.args.get("q") or "").strip()
+    if len(q) < 2:
+        return jsonify([])
+    return jsonify(_geocode_search(q))
+
+
+@app.route("/setup/save", methods=["POST"])
+def setup_save():
+    """Persist location + dashboard password (setup stays 'incomplete' until finish)."""
+    data = request.get_json(silent=True) or {}
+    loc  = data.get("location") or {}
+    pw   = (data.get("web_password") or "").strip()
+
+    # Validate location
+    try:
+        lat = float(loc.get("lat")); lon = float(loc.get("lon"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="Please choose a valid location."), 400
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return jsonify(ok=False, error="Coordinates out of range."), 400
+    tz   = (loc.get("tz") or "").strip()
+    if not _valid_tz(tz):
+        return jsonify(ok=False, error=f"Unknown timezone: {tz}"), 400
+    name = (loc.get("name") or "").strip() or f"{lat:.3f}, {lon:.3f}"
+
+    # Validate password
+    if len(pw) < 4:
+        return jsonify(ok=False, error="Password must be at least 4 characters."), 400
+
+    _cfg.save_setup({
+        "location": {"name": name, "lat": lat, "lon": lon, "tz": tz},
+        "web_password": pw,
+    })
+    return jsonify(ok=True)
+
+
+@app.route("/setup/finish", methods=["POST"])
+def setup_finish():
+    """Mark setup complete → the display unblocks and the dashboard goes live."""
+    saved = _cfg.load_setup()
+    if not (saved.get("location") and saved.get("web_password")):
+        return jsonify(ok=False, error="Finish the location and password step first."), 400
+    spotify_connected = False
+    if _SPOTIFY_CONF.exists():
+        try:
+            spotify_connected = bool(json.loads(_SPOTIFY_CONF.read_text()).get("refresh_token"))
+        except Exception:
+            pass
+    _cfg.save_setup({
+        "setup_complete": True,
+        "spotify_skipped": not spotify_connected,
+    })
+    # The web user is implicitly authenticated after finishing first-run setup.
+    session["authed"] = True
+    return jsonify(ok=True, redirect="/")
+
+
+_SETUP_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>{{ title }} – Setup</title>
+<style>
+:root{--bg:#08090c;--surface:#111318;--border:#252830;--blue:#3b82f6;--green:#1DB954;--white:#e8eaf0;--sub:#6b7280;}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;background:var(--bg);color:var(--white);min-height:100vh;display:flex;align-items:flex-start;justify-content:center;padding:24px;}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:20px;padding:28px 24px;width:100%;max-width:440px;margin-top:24px;}
+.logo{font-size:36px;text-align:center;margin-bottom:8px;}
+h1{font-size:21px;font-weight:700;text-align:center;margin-bottom:4px;}
+.sub{font-size:13px;color:var(--sub);text-align:center;margin-bottom:18px;}
+.steps{display:flex;gap:6px;justify-content:center;margin-bottom:22px;}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--border);transition:.2s;}
+.dot.on{background:var(--blue);width:22px;border-radius:4px;}
+.step{display:none;}.step.on{display:block;}
+label{display:block;font-size:13px;font-weight:600;color:var(--sub);margin:14px 0 5px;}
+input{width:100%;background:#1a1d25;border:1px solid var(--border);border-radius:10px;padding:11px 14px;color:var(--white);font-size:15px;outline:none;}
+input:focus{border-color:var(--blue);}
+.row{display:flex;gap:8px;}.row>div{flex:1;}
+.btn{display:block;width:100%;margin-top:20px;padding:13px;background:var(--blue);color:#fff;font-weight:700;font-size:16px;border:none;border-radius:12px;cursor:pointer;}
+.btn:hover{opacity:.9;}.btn:disabled{opacity:.4;cursor:not-allowed;}
+.btn.green{background:var(--green);color:#000;}
+.btn.ghost{background:transparent;border:1px solid var(--border);color:var(--white);}
+.hint{font-size:12px;color:var(--sub);margin-top:6px;}
+.hint a{color:var(--blue);text-decoration:none;}
+.err{background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);color:#fca5a5;border-radius:10px;padding:10px 14px;font-size:13px;margin-top:14px;text-align:center;display:none;}
+.ok{background:rgba(29,185,84,.1);border:1px solid rgba(29,185,84,.3);color:#86efac;border-radius:10px;padding:10px 14px;font-size:13px;margin:6px 0;text-align:center;}
+.results{margin-top:8px;border:1px solid var(--border);border-radius:10px;overflow:hidden;}
+.results div{padding:10px 14px;font-size:14px;cursor:pointer;border-bottom:1px solid var(--border);}
+.results div:last-child{border-bottom:none;}
+.results div:hover{background:#1a1d25;}
+.picked{background:rgba(59,130,246,.1);border:1px solid rgba(59,130,246,.35);color:#93c5fd;border-radius:10px;padding:10px 14px;font-size:13px;margin-top:10px;display:none;}
+.toggle{font-size:12px;color:var(--blue);text-align:center;margin-top:12px;cursor:pointer;}
+.manual{display:none;margin-top:6px;}
+.muted{font-size:12px;color:var(--sub);text-align:center;margin-top:14px;}
+.muted a{color:var(--blue);text-decoration:none;cursor:pointer;}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">📺</div>
+  <h1>{{ title }}</h1>
+  <p class="sub">First-time setup</p>
+  <div class="steps"><div class="dot on" id="d1"></div><div class="dot" id="d2"></div><div class="dot" id="d3"></div></div>
+
+  <!-- STEP 1: LOCATION -->
+  <div class="step on" id="s1">
+    <label>Where is this display? (city)</label>
+    <input id="city" type="text" placeholder="e.g. Nashville, TN" autocomplete="off" autocapitalize="words">
+    <div class="results" id="results" style="display:none"></div>
+    {% if ip_lat %}
+    <p class="hint">Not sure? <a onclick="useIP()">Use my approximate location ({{ ip_name }})</a></p>
+    {% endif %}
+    <div class="picked" id="picked"></div>
+    <div class="toggle" onclick="toggleManual()">Enter exact coordinates instead ▾</div>
+    <div class="manual" id="manual">
+      <div class="row">
+        <div><label>Latitude</label><input id="mlat" inputmode="decimal" placeholder="35.05" value="{{ prefill_lat }}"></div>
+        <div><label>Longitude</label><input id="mlon" inputmode="decimal" placeholder="-85.32" value="{{ prefill_lon }}"></div>
+      </div>
+      <label>Timezone (IANA, e.g. America/New_York)</label>
+      <input id="mtz" placeholder="America/New_York" value="{{ prefill_tz or ip_tz }}">
+      <button class="btn ghost" onclick="useManual()">Use these coordinates</button>
+    </div>
+    <button class="btn" id="next1" onclick="step(2)">Continue →</button>
+  </div>
+
+  <!-- STEP 2: PASSWORD -->
+  <div class="step" id="s2">
+    <label>Create a dashboard password</label>
+    <input id="pw" type="password" placeholder="Used to log into this control panel">
+    <label>Confirm password</label>
+    <input id="pw2" type="password" placeholder="Re-enter password">
+    <p class="hint">You'll use this to open the web dashboard from any device.</p>
+    <button class="btn" onclick="saveCore()">Save &amp; continue →</button>
+    <div class="muted"><a onclick="step(1)">← Back</a></div>
+  </div>
+
+  <!-- STEP 3: SPOTIFY -->
+  <div class="step" id="s3">
+    <div class="logo" style="font-size:30px">🎵</div>
+    <p class="sub">Connect Spotify so now-playing art shows on the display. Optional — you can do this later.</p>
+    <div class="ok" id="spOk" style="display:{{ 'block' if spotify_connected else 'none' }}">✅ Spotify connected</div>
+    <a class="btn green" href="/spotify/setup" style="text-decoration:none;text-align:center">{{ 'Reconnect Spotify' if spotify_connected else 'Connect Spotify →' }}</a>
+    <button class="btn" onclick="finish()">{{ 'Finish' if spotify_connected else 'Finish without Spotify' }}</button>
+    <div class="muted"><a onclick="step(2)">← Back</a></div>
+  </div>
+
+  <div class="err" id="err"></div>
+</div>
+
+<script>
+var picked = null;
+{% if has_location %}picked = {name:"{{ prefill_name }}", lat:{{ prefill_lat }}, lon:{{ prefill_lon }}, tz:"{{ prefill_tz }}"};{% endif %}
+var ipLoc = {name:"{{ ip_name }}", lat:"{{ ip_lat }}", lon:"{{ ip_lon }}", tz:"{{ ip_tz }}"};
+
+function showErr(m){var e=document.getElementById('err');e.textContent=m;e.style.display='block';setTimeout(function(){e.style.display='none';},5000);}
+function setDots(n){for(var i=1;i<=3;i++){document.getElementById('d'+i).classList.toggle('on',i<=n);}}
+function step(n){for(var i=1;i<=3;i++){document.getElementById('s'+i).classList.toggle('on',i===n);}setDots(n);window.scrollTo(0,0);}
+
+function renderPicked(){if(!picked)return;var p=document.getElementById('picked');p.textContent='📍 '+picked.name+'  ('+Number(picked.lat).toFixed(3)+', '+Number(picked.lon).toFixed(3)+')';p.style.display='block';}
+renderPicked();
+
+var t=null;
+document.getElementById('city').addEventListener('input',function(e){
+  clearTimeout(t);var q=e.target.value.trim();var box=document.getElementById('results');
+  if(q.length<2){box.style.display='none';return;}
+  t=setTimeout(function(){
+    fetch('/setup/geocode?q='+encodeURIComponent(q)).then(function(r){return r.json();}).then(function(list){
+      if(!list.length){box.style.display='none';return;}
+      box.innerHTML='';list.forEach(function(c){
+        var d=document.createElement('div');d.textContent=c.name+'  ·  '+c.tz;
+        d.onclick=function(){picked={name:c.name,lat:c.lat,lon:c.lon,tz:c.tz};renderPicked();box.style.display='none';document.getElementById('city').value=c.name;};
+        box.appendChild(d);
+      });box.style.display='block';
+    });
+  },300);
+});
+
+function useIP(){if(!ipLoc.lat){return;}picked={name:ipLoc.name,lat:parseFloat(ipLoc.lat),lon:parseFloat(ipLoc.lon),tz:ipLoc.tz};renderPicked();}
+function toggleManual(){var m=document.getElementById('manual');m.style.display=m.style.display==='block'?'none':'block';}
+function useManual(){
+  var lat=parseFloat(document.getElementById('mlat').value),lon=parseFloat(document.getElementById('mlon').value),tz=document.getElementById('mtz').value.trim();
+  if(isNaN(lat)||isNaN(lon)){showErr('Enter valid latitude and longitude.');return;}
+  if(!tz){showErr('Enter a timezone.');return;}
+  picked={name:lat.toFixed(3)+', '+lon.toFixed(3),lat:lat,lon:lon,tz:tz};renderPicked();
+}
+
+function saveCore(){
+  if(!picked){showErr('Choose a location first (step 1).');step(1);return;}
+  var pw=document.getElementById('pw').value,pw2=document.getElementById('pw2').value;
+  if(pw.length<4){showErr('Password must be at least 4 characters.');return;}
+  if(pw!==pw2){showErr('Passwords do not match.');return;}
+  fetch('/setup/save',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({location:picked,web_password:pw})})
+    .then(function(r){return r.json().then(function(j){return {s:r.ok,j:j};});})
+    .then(function(o){if(!o.s||!o.j.ok){showErr(o.j.error||'Could not save.');return;}step(3);});
+}
+
+function finish(){
+  fetch('/setup/finish',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
+    .then(function(r){return r.json().then(function(j){return {s:r.ok,j:j};});})
+    .then(function(o){if(!o.s||!o.j.ok){showErr(o.j.error||'Could not finish.');return;}window.location=o.j.redirect||'/';});
+}
+
+function next1(){step(2);}
+document.getElementById('next1').onclick=function(){if(!picked){showErr('Choose a location first.');return;}step(2);};
+</script>
+</body>
+</html>"""
 
 
 if __name__ == "__main__":

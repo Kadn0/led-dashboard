@@ -107,6 +107,7 @@ from dashboard_config import (
     PHOTO_SETTINGS_FILE as _PHOTO_SETTINGS_FILE_STR,
     CLOCK_SETTINGS_FILE,
 )
+import dashboard_config as _cfg   # for first-run setup state (setup_is_complete, effective_location, …)
 
 _PID_FILE = PID_FILE
 def _acquire_pid_lock():
@@ -2786,6 +2787,20 @@ def main():
     • Threads are daemon so they exit when main process exits
     • No resource leaks: all connections reused via session pool
     """
+    # ── First-run setup gate ──
+    # On a brand-new install (no completed setup) show ONE QR pointing at the web
+    # setup wizard and block here until the user finishes location / password /
+    # Spotify. Once "setup_complete" is cached in ~/.dashboard_setup.json this
+    # never runs again — the dashboard boots straight through on every reboot.
+    if not _cfg.setup_is_complete():
+        ip = _get_local_ip()
+        setup_url = f"http://{ip}:{WEB_PORT}/setup"
+        print(f"First-time setup required — scan the QR or visit {setup_url}")
+        draw_qr_screen(setup_url, top_label="SETUP", bot_label="SCAN TO START")
+        while not _cfg.setup_is_complete():
+            time.sleep(3)
+        print("Setup complete — starting dashboard")
+
     cf = Path(os.path.expanduser("~/.spotify_display.conf"))
 
     # ── Load config (may not exist on a brand-new install) ──
@@ -2825,15 +2840,14 @@ def main():
     if config.get("client_id") and config.get("client_secret") and config.get("refresh_token"):
         spotify = SpotifyClient(config["client_id"], config["client_secret"], config["refresh_token"])
 
-    # ── One-time startup geolocation (overrides config coords if successful) ──
-    global CHATTANOOGA_LAT, CHATTANOOGA_LON
-    geo = _detect_location()
-    if geo:
-        CHATTANOOGA_LAT, CHATTANOOGA_LON, _geo_city = geo
-        print(f"Location auto-detected: {_geo_city} ({CHATTANOOGA_LAT:.4f}, {CHATTANOOGA_LON:.4f})")
-    else:
-        _geo_city = LOCATION_NAME   # fall back to config value
-        print(f"Location: using config ({CHATTANOOGA_LAT:.4f}, {CHATTANOOGA_LON:.4f})")
+    # ── Apply the user-entered location from the setup wizard ──
+    # effective_location() returns the wizard-chosen city (persisted in the setup
+    # file), falling back to the dashboard_config defaults if setup was skipped.
+    # This drives weather, AQI, sun times, the flight radius and ISS distance.
+    global CHATTANOOGA_LAT, CHATTANOOGA_LON, LOCATION_TZ, LOCATION_NAME
+    _geo_city, CHATTANOOGA_LAT, CHATTANOOGA_LON, LOCATION_TZ = _cfg.effective_location()
+    LOCATION_NAME = _geo_city
+    print(f"Location: {_geo_city} ({CHATTANOOGA_LAT:.4f}, {CHATTANOOGA_LON:.4f}) tz={LOCATION_TZ}")
 
     # ── HomePod / Apple TV: auto-discover via mDNS ──
     # mDNS scanning allows us to find any HomePod/AppleTV on the local network without hardcoded IPs.
