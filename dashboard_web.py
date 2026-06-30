@@ -326,6 +326,19 @@ body {
 /* ── Radar map ── */
 #radarMap { border-radius:13px 13px 0 0; }
 
+/* ── Location picker results (Settings) ── */
+.loc-results { border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+.loc-results div { padding:9px 13px; font-size:13px; cursor:pointer; border-bottom:1px solid var(--border); color:var(--text); }
+.loc-results div:last-child { border-bottom:none; }
+.loc-results div:hover { background:var(--surface); }
+
+/* ── Desktop: pack the grid and let the hero widgets span 2 columns ── */
+@media(min-width:900px) {
+  .dash-grid { grid-auto-flow:dense; }
+  .dash-wide { grid-column:span 2; }
+  #radarMap  { height:360px!important; }
+}
+
 /* ── Section titles ── */
 .section-title { font-family:'Share Tech Mono',monospace; font-size:12px; letter-spacing:2px; text-transform:uppercase; color:var(--muted); padding:0 2px 0 11px; margin-bottom:10px; border-left:3px solid var(--cyan); line-height:1.4; }
 
@@ -655,7 +668,7 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
 </div>
 
 <!-- Live Radar -->
-<div class="section">
+<div class="section dash-wide">
   <div class="section-title">// Live Radar</div>
   <div class="card" style="padding:0;overflow:hidden;border-radius:14px">
     <div id="radarMap" style="height:280px;width:100%"></div>
@@ -672,7 +685,7 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
 </div>
 
 <!-- ISS Tracker + API Monitors stacked -->
-<div class="dash-stack">
+<div class="dash-stack dash-wide">
   <div class="section">
     <div class="section-title">// ISS Tracker</div>
     <div class="card" id="issCard"><div class="radar-empty">Loading…</div></div>
@@ -775,6 +788,32 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
       </div>
       <button class="btn-primary" onclick="saveClockZones()" style="margin-top:12px;width:100%">Save Time Zones</button>
     </div>
+  </div>
+</div>
+
+<!-- Location -->
+<div class="section dash-full">
+  <div class="section-title">// Location</div>
+  <div class="card">
+    <div style="font-size:13px;color:var(--muted);margin-bottom:10px">Search a city or drop a pin on the map. Sets weather, flights, sunrise/sunset and ISS distance.</div>
+    <input id="locSearch" type="text" placeholder="Search a city…" autocomplete="off" autocapitalize="words" style="width:100%;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:11px 14px;color:var(--text);font-size:14px;font-family:inherit;outline:none;margin-bottom:8px">
+    <div class="loc-results" id="locResults" style="display:none;margin-bottom:10px"></div>
+    <div id="locMap" style="height:300px;width:100%;border-radius:10px;overflow:hidden;border:1px solid var(--border)"></div>
+    <div id="locPicked" style="font-family:'Share Tech Mono',monospace;font-size:13px;color:var(--cyan);margin-top:10px">—</div>
+    <button class="btn-primary" id="locSaveBtn" onclick="saveLocation()" style="margin-top:10px;width:100%">Save Location &amp; Restart Display</button>
+  </div>
+</div>
+
+<!-- Spotify -->
+<div class="section">
+  <div class="section-title">// Spotify</div>
+  <div class="card">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+      <div id="spDot" style="width:9px;height:9px;border-radius:50%;background:var(--muted);flex-shrink:0"></div>
+      <div style="font-size:14px;color:var(--text)" id="spStatus">Checking…</div>
+    </div>
+    <div style="font-size:13px;color:var(--muted);margin-bottom:14px">Re-authenticate if now-playing art stops updating, the token was revoked, or you switched Spotify apps.</div>
+    <a class="btn-primary" href="/spotify/setup" style="text-decoration:none;text-align:center;width:100%">Re-authenticate Spotify →</a>
   </div>
 </div>
 
@@ -1919,11 +1958,67 @@ async function saveClockZones() {
   showToast('Time zones saved');
 }
 
+// ── Location settings (map pin-drop + city search) ─────────────────────
+let _locMap=null, _locMarker=null, _locPick=null, _locT=null;
+function initLocMap(){
+  if(_locMap){ setTimeout(()=>_locMap.invalidateSize(), 60); return; }
+  _locMap = L.map('locMap', {center:[MAP_LAT,MAP_LON], zoom:9, attributionControl:false});
+  L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {maxZoom:18}).addTo(_locMap);
+  _locMap.on('click', e=>setLocPin(e.latlng.lat, e.latlng.lng, '', ''));
+  fetch('/api/location').then(r=>r.json()).then(d=>{
+    if(d.lat!=null){ setLocPin(d.lat, d.lon, d.name, d.tz); _locMap.setView([d.lat,d.lon], 9); }
+  }).catch(()=>{});
+  setTimeout(()=>_locMap.invalidateSize(), 80);
+}
+function setLocPin(lat, lon, name, tz){
+  _locPick = {lat:lat, lon:lon, name:name||'', tz:tz||''};
+  if(_locMarker) _locMarker.setLatLng([lat,lon]);
+  else _locMarker = L.marker([lat,lon], {draggable:true}).addTo(_locMap)
+        .on('dragend', ev=>{ const p=ev.target.getLatLng(); setLocPin(p.lat, p.lng, '', ''); });
+  document.getElementById('locPicked').textContent =
+    '\u{1F4CD} ' + (name?name+'  ':'') + lat.toFixed(4) + ', ' + lon.toFixed(4) + (tz?'  ·  '+tz:'');
+}
+document.getElementById('locSearch')?.addEventListener('input', function(e){
+  clearTimeout(_locT); const q=e.target.value.trim(); const box=document.getElementById('locResults');
+  if(q.length<2){ box.style.display='none'; return; }
+  _locT=setTimeout(()=>{
+    fetch('/setup/geocode?q='+encodeURIComponent(q)).then(r=>r.json()).then(list=>{
+      if(!list.length){ box.style.display='none'; return; }
+      box.innerHTML=''; list.forEach(c=>{
+        const d=document.createElement('div'); d.textContent=c.name+'  ·  '+c.tz;
+        d.onclick=()=>{ setLocPin(c.lat,c.lon,c.name,c.tz); _locMap.setView([c.lat,c.lon],10); box.style.display='none'; document.getElementById('locSearch').value=c.name; };
+        box.appendChild(d);
+      }); box.style.display='block';
+    }).catch(()=>{});
+  }, 300);
+});
+function saveLocation(){
+  if(!_locPick){ showToast('Pick a location first'); return; }
+  const btn=document.getElementById('locSaveBtn'); btn.disabled=true;
+  fetch('/api/location', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(_locPick)})
+    .then(r=>r.json().then(j=>({s:r.ok,j:j})))
+    .then(o=>{ btn.disabled=false;
+      if(!o.s||!o.j.ok){ showToast(o.j.error||'Save failed'); return; }
+      setLocPin(o.j.lat,o.j.lon,o.j.name,o.j.tz);
+      showToast('Location saved — restarting display'); });
+}
+
+// ── Spotify status ─────────────────────────────────────────────────────
+function loadSpotifyStatus(){
+  fetch('/api/spotify_status').then(r=>r.json()).then(d=>{
+    const dot=document.getElementById('spDot'), st=document.getElementById('spStatus'); if(!dot) return;
+    if(d.connected){ dot.style.background='var(--green)'; st.textContent='Connected'; }
+    else if(d.has_creds){ dot.style.background='var(--amber)'; st.textContent='Credentials saved — not authorised'; }
+    else { dot.style.background='var(--muted)'; st.textContent='Not connected'; }
+  }).catch(()=>{});
+}
+
 // ── Tab switching ──────────────────────────────────────────────────────
 function switchTab(name){
   document.querySelectorAll('.tab-panel').forEach(p=>p.classList.toggle('active', p.id==='tab-'+name));
   document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
   try{ localStorage.setItem('dashTab', name); }catch(e){}
+  if(name==='settings'){ initLocMap(); loadSpotifyStatus(); }
   // Leaflet needs a nudge if its container was hidden when created
   setTimeout(()=>window.dispatchEvent(new Event('resize')), 60);
 }
@@ -2379,9 +2474,89 @@ def api_restart(which):
     return ('', 204)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SPOTIFY OAUTH SETUP  (zero-console first-run flow)
+# LOCATION & SPOTIFY SETTINGS  (Settings tab)
 # ─────────────────────────────────────────────────────────────────────────────
 _SPOTIFY_CONF = Path(os.path.expanduser("~/.spotify_display.conf"))
+
+
+def _resolve_timezone(lat, lon):
+    """Resolve an IANA timezone for arbitrary coords via Open-Meteo (timezone=auto)."""
+    try:
+        r = _req.get("https://api.open-meteo.com/v1/forecast",
+                     params={"latitude": lat, "longitude": lon,
+                             "timezone": "auto", "forecast_days": 1}, timeout=6)
+        tz = r.json().get("timezone")
+        if tz and _valid_tz(tz):
+            return tz
+    except Exception:
+        pass
+    return None
+
+
+def _reverse_geocode(lat, lon):
+    """Best-effort place name for a dropped pin (keyless BigDataCloud endpoint)."""
+    try:
+        r = _req.get("https://api.bigdatacloud.net/data/reverse-geocode-client",
+                     params={"latitude": lat, "longitude": lon, "localityLanguage": "en"},
+                     timeout=6)
+        d = r.json()
+        parts = [d.get("city") or d.get("locality"),
+                 d.get("principalSubdivision"), d.get("countryCode")]
+        name = ", ".join(p for p in parts if p)
+        return name or None
+    except Exception:
+        return None
+
+
+@app.route("/api/spotify_status")
+@login_required
+def api_spotify_status():
+    connected = has_creds = False
+    if _SPOTIFY_CONF.exists():
+        try:
+            d = json.loads(_SPOTIFY_CONF.read_text())
+            has_creds = bool(d.get("client_id") and d.get("client_secret"))
+            connected = bool(d.get("refresh_token"))
+        except Exception:
+            pass
+    return jsonify(connected=connected, has_creds=has_creds)
+
+
+@app.route("/api/location", methods=["GET", "POST"])
+@login_required
+def api_location():
+    if request.method == "GET":
+        name, lat, lon, tz = _cfg.effective_location()
+        return jsonify(name=name, lat=lat, lon=lon, tz=tz)
+
+    data = request.get_json(silent=True) or {}
+    try:
+        lat = float(data.get("lat")); lon = float(data.get("lon"))
+    except (TypeError, ValueError):
+        return jsonify(ok=False, error="Invalid coordinates."), 400
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return jsonify(ok=False, error="Coordinates out of range."), 400
+
+    tz = (data.get("tz") or "").strip()
+    if not _valid_tz(tz):
+        tz = _resolve_timezone(lat, lon)
+    if not tz:
+        return jsonify(ok=False, error="Could not determine the timezone for that spot."), 400
+
+    name = (data.get("name") or "").strip() or _reverse_geocode(lat, lon) or f"{lat:.3f}, {lon:.3f}"
+    _cfg.save_setup({"location": {"name": name, "lat": lat, "lon": lon, "tz": tz}})
+
+    # Restart the display so weather/flights/ISS pick up the new coords immediately.
+    import threading, subprocess
+    threading.Thread(
+        target=lambda: subprocess.run(["systemctl", "restart", "spotify-display.service"]),
+        daemon=True).start()
+    return jsonify(ok=True, name=name, lat=lat, lon=lon, tz=tz)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SPOTIFY OAUTH SETUP  (zero-console first-run flow)
+# ─────────────────────────────────────────────────────────────────────────────
 
 _SPOTIFY_SCOPE = "user-read-currently-playing"
 
