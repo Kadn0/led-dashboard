@@ -2192,7 +2192,7 @@ function hideFlightPopup() {
 
 # Routes
 
-_TMPL_VARS = dict(title=WEB_TITLE, location_lat=LOCATION_LAT, location_lon=LOCATION_LON)
+_TMPL_VARS = dict(title=WEB_TITLE, location_lat=LOCATION_LAT, location_lon=LOCATION_LON, web_port=WEB_PORT)
 
 @app.route("/login", methods=["GET","POST"])
 def login():
@@ -2794,11 +2794,15 @@ input:focus{border-color:var(--blue);}
     <input name="client_id" type="text" placeholder="e.g. 3abc…" value="{{ prefill_id }}" required autocomplete="off" autocorrect="off" autocapitalize="none">
     <label>Spotify Client Secret</label>
     <input name="client_secret" type="password" placeholder="••••••••••••••••" value="{{ prefill_secret }}" required autocomplete="off">
-    <p class="hint">
-      Create an app at <a href="https://developer.spotify.com/dashboard" target="_blank">developer.spotify.com</a>,
-      then add <code>{{ redirect_uri }}</code> as a Redirect URI.
-    </p>
-    <button class="btn" type="submit">Connect with Spotify →</button>
+    <div style="background:#0d1320;border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:16px">
+      <div style="font-size:12px;color:var(--sub);margin-bottom:7px">In your <a href="https://developer.spotify.com/dashboard" target="_blank" style="color:var(--blue);text-decoration:none">Spotify app</a> → <b>Settings → Edit</b>, add this <b>exact</b> Redirect URI and Save:</div>
+      <div style="display:flex;gap:8px;align-items:stretch">
+        <code id="ruri" style="flex:1;min-width:0;font-size:12px;color:#9fd4ff;word-break:break-all;background:#0a0f17;padding:9px 11px;border-radius:7px;border:1px solid var(--border)">{{ redirect_uri }}</code>
+        <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('ruri').textContent);this.textContent='Copied'" style="flex-shrink:0;background:#1a1d25;border:1px solid var(--border);color:var(--white);border-radius:7px;padding:0 12px;font-size:13px;cursor:pointer">Copy</button>
+      </div>
+      <div style="font-size:11px;color:var(--sub);margin-top:8px;line-height:1.5">It must match character-for-character — scheme (<b>http</b>), IP, port (<b>{{ web_port }}</b>) and the <b>/spotify/callback</b> path. The "Not matching configuration" error means it differs from what's saved in Spotify.</div>
+    </div>
+    <button class="btn" type="submit" style="margin-top:16px">Connect with Spotify →</button>
   </form>
 </div>
 </body>

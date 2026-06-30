@@ -1052,6 +1052,9 @@ class FlightTracker:
         self.positions = {}             # Current aircraft: {callsign: {lat, lon, altitude, speed, heading, ...}}
         self.lock = threading.Lock()    # Protects positions dict from race conditions
         self.api_index = 0              # Which API to try first (rotates)
+        self._polling = False           # In-flight guard: True while a poll is running,
+                                        # so a fast poll interval can never stack overlapping
+                                        # ADS-B requests (caps load to one request cycle at a time).
         self._route_pending = set()     # Callsigns currently being fetched in background
                                         # NOTE: accessed from main + route threads without a lock.
                                         # The GIL makes individual add/discard atomic, so the
@@ -1135,7 +1138,17 @@ class FlightTracker:
         result = sorted(seen.values(), key=lambda p: p["distance"])
         return result
     def start_poll(self):
-        threading.Thread(target=self.poll_in_background, daemon=True).start()
+        # Skip if a poll is already running so a short FLIGHT_POLL_INTERVAL can't
+        # stack overlapping requests and hammer the ADS-B providers.
+        if self._polling:
+            return
+        self._polling = True
+        def _run():
+            try:
+                self.poll_in_background()
+            finally:
+                self._polling = False
+        threading.Thread(target=_run, daemon=True).start()
     def get_interpolated_planes(self):
         now = time.time(); result = []
         with self.lock:
