@@ -2693,6 +2693,18 @@ def api_location():
     name = (data.get("name") or "").strip() or _reverse_geocode(lat, lon) or f"{lat:.3f}, {lon:.3f}"
     _cfg.save_setup({"location": {"name": name, "lat": lat, "lon": lon, "tz": tz}})
 
+    # Drop the cached startup-zoom satellite tiles so the intro animation
+    # re-fetches imagery for the new pin instead of zooming to the old spot.
+    try:
+        import glob
+        for f in glob.glob(os.path.join(str(CACHE_DIR), "location_*")):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # Restart the display so weather/flights/ISS pick up the new coords immediately.
     import threading, subprocess
     threading.Thread(

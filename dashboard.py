@@ -2419,7 +2419,10 @@ def do_globe_intro(reveal_img, flights_tracker=None, city_name=None):
     # ── Satellite close-up tile (ESRI World Imagery, cached) ─────────────
     # We fetch one 256×256 tile at zoom=10 centred on the configured location.
     # The tile URL scheme is standard XYZ/TMS.
-    TILE_CACHE = CACHE_DIR / "location_tile.jpg"
+    # Cache keyed by the configured coordinates so moving the setup pin
+    # invalidates the previous location's imagery and the intro zoom retargets.
+    _loc_key   = f"{CHATTANOOGA_LAT:.3f}_{CHATTANOOGA_LON:.3f}"
+    TILE_CACHE = CACHE_DIR / f"location_tile_{_loc_key}.jpg"
 
     def _deg2tile(lat_deg, lon_deg, zoom):
         """Convert geographic coordinates to XYZ tile indices."""
@@ -2583,8 +2586,8 @@ def do_globe_intro(reveal_img, flights_tracker=None, city_name=None):
     # Zoom-10: ~20km per tile, 3×3 = ~60km — shows 25-mile plane radius.
     CITY_ZOOM  = 12
     PLANE_ZOOM = 10
-    CITY_CACHE  = str(CACHE_DIR / "location_city_z12.jpg")
-    PLANE_CACHE = str(CACHE_DIR / "location_planeview_z10.jpg")
+    CITY_CACHE  = str(CACHE_DIR / f"location_city_z12_{_loc_key}.jpg")
+    PLANE_CACHE = str(CACHE_DIR / f"location_planeview_z10_{_loc_key}.jpg")
 
     _city_box  = [None]
     _plane_box = [None]
