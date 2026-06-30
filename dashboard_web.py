@@ -871,6 +871,12 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
           Restart Web
         </button>
         <button class="btn-danger" onclick="clearArtCache()">Clear Art Cache</button>
+        <hr style="margin:4px 0">
+        <button class="btn-danger" onclick="factoryReset()" style="border-color:rgba(255,34,68,.55)">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:5px"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+          Factory Reset
+        </button>
+        <div style="font-size:11px;color:var(--muted);text-align:center;line-height:1.4">Erases all settings &amp; returns to setup. Photos are kept.</div>
       </div>
     </div>
   </div>
@@ -2003,6 +2009,17 @@ function saveLocation(){
       showToast('Location saved — restarting display'); });
 }
 
+// ── Factory reset ──────────────────────────────────────────────────────
+function factoryReset(){
+  if(!confirm('Factory reset?\n\nThis erases location, dashboard password, Spotify connection and all settings, then returns to first-time setup.\n\nYour uploaded photos are KEPT.')) return;
+  if(!confirm('Are you absolutely sure? The display will reboot into the setup QR screen and you will need to run setup again.')) return;
+  fetch('/api/factory_reset', {method:'POST'})
+    .then(r=>r.json())
+    .then(j=>{ if(j.ok){ showToast('Factory reset — returning to setup'); setTimeout(()=>location.href=j.redirect||'/setup', 1500); }
+               else showToast('Reset failed'); })
+    .catch(()=>showToast('Reset failed'));
+}
+
 // ── Spotify status ─────────────────────────────────────────────────────
 function loadSpotifyStatus(){
   fetch('/api/spotify_status').then(r=>r.json()).then(d=>{
@@ -2552,6 +2569,52 @@ def api_location():
         target=lambda: subprocess.run(["systemctl", "restart", "spotify-display.service"]),
         daemon=True).start()
     return jsonify(ok=True, name=name, lat=lat, lon=lon, tz=tz)
+
+
+@app.route("/api/factory_reset", methods=["POST"])
+@login_required
+def api_factory_reset():
+    """Erase all configuration and return to first-run setup.
+
+    Removes location, web password, Spotify credentials and every settings/cache
+    file, then restarts the display so it boots back into the setup QR screen.
+    Deliberately KEEPS the uploaded photos in PHOTOS_DIR.
+    """
+    # Files to delete (everything except the photos folder).
+    targets = [
+        _cfg.SETUP_FILE,                       # location + password + setup flag
+        os.path.expanduser("~/.spotify_display.conf"),  # Spotify creds/tokens
+        MANUAL_TRACK_FILE, OVERRIDE_FILE, STATUS_FILE,
+        PHOTO_SETTINGS_FILE, BRIGHT_SCHEDULE_FILE, CLOCK_SETTINGS_FILE,
+    ]
+    for path in targets:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"Factory reset: could not remove {path}: {e}")
+
+    # Clear the art cache directory contents (but keep the directory itself).
+    try:
+        import glob
+        for f in glob.glob(os.path.join(str(CACHE_DIR), "*")):
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # End this admin session — the new owner sets a fresh password in the wizard.
+    session.clear()
+
+    # Restart the display so it shows the setup QR and blocks until reconfigured.
+    import threading, subprocess
+    threading.Thread(
+        target=lambda: subprocess.run(["systemctl", "restart", "spotify-display.service"]),
+        daemon=True).start()
+    return jsonify(ok=True, redirect="/setup")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
