@@ -1531,25 +1531,34 @@ def render_clock_analog(s=None):
 
     W, H = MATRIX_WIDTH, MATRIX_HEIGHT
     cx, cy = W // 2, H // 2
-    R = 30
+    S = 30                       # half-size of the square dial
     accent = _clk_accent(s)
 
-    # ── Tick ring: 12 marks, longer/brighter at the quarters ──
-    for i in range(12):
-        ang = i / 12.0 * 2 * math.pi
-        sinA, cosA = math.sin(ang), math.cos(ang)
-        major = (i % 3 == 0)
-        r_in = R - (6 if major else 3)
-        col  = accent if major else _scale(accent, 0.5)
-        draw.line([(cx + sinA * r_in, cy - cosA * r_in),
-                   (cx + sinA * R,    cy - cosA * R)], fill=col, width=1)
+    def square_edge(frac, inset=0):
+        """Point where the ray for clock fraction `frac` (0=12 o'clock, clockwise)
+        meets the square dial, pulled `inset` px inward from the edge."""
+        ang = frac * 2 * math.pi
+        sx, sy = math.sin(ang), -math.cos(ang)
+        m = max(abs(sx), abs(sy)) or 1.0
+        t = (S - inset) / m
+        return (cx + sx * t, cy + sy * t)
 
-    # ── California-style numerals at 12 / 3 / 6 / 9 ──
+    # ── Square dial frame ──
+    draw.rectangle([(cx - S, cy - S), (cx + S - 1, cy + S - 1)],
+                   outline=_scale(accent, 0.35))
+
+    # ── 12 hour ticks projected onto the square edge (longer at quarters) ──
+    for i in range(12):
+        frac  = i / 12.0
+        major = (i % 3 == 0)
+        col   = accent if major else _scale(accent, 0.5)
+        draw.line([square_edge(frac, 5 if major else 3), square_edge(frac, 0)],
+                  fill=col, width=1)
+
+    # ── Numerals at 12 / 3 / 6 / 9, just inside the edges ──
     nf = get_font(8)
     for num, frac in (("12", 0.0), ("3", 0.25), ("6", 0.5), ("9", 0.75)):
-        ang = frac * 2 * math.pi
-        nx = cx + math.sin(ang) * (R - 9)
-        ny = cy - math.cos(ang) * (R - 9)
+        nx, ny = square_edge(frac, 9)
         draw.text((nx, ny), num, font=nf, fill=_scale(accent, 0.9), anchor="mm")
 
     sec  = dt.second + dt.microsecond / 1e6
