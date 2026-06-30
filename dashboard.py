@@ -1362,7 +1362,33 @@ _DEFAULT_CLOCK_ZONES = [(l, tz) for (l, tz, _c) in CLOCK_TIMEZONES][:4]
 # bottom-left, bottom-right). Keeps the look stable regardless of which zones
 # the user picks on the web page.
 _CLOCK_SLOT_COLORS = [(255,255,100), (200,255,200), (180,220,255), (255,150,200)]
-SINGLE_CLOCK_TZ = "America/New_York"   # Eastern, used by the single-zone mode
+SINGLE_CLOCK_TZ = "America/New_York"   # legacy fallback if no location tz is set
+_DEFAULT_CLOCK_COLOR = (0, 190, 255)   # default accent for single/analog modes
+
+def _single_clock_tz():
+    """The single/analog clock follows the configured location timezone."""
+    try:
+        return LOCATION_TZ or SINGLE_CLOCK_TZ
+    except Exception:
+        return SINGLE_CLOCK_TZ
+
+def _clk_accent(s):
+    """Accent colour (digits / hands / sweep) from settings, default cyan."""
+    c = s.get("color") if isinstance(s, dict) else None
+    if isinstance(c, (list, tuple)) and len(c) == 3:
+        try:
+            return tuple(max(0, min(255, int(v))) for v in c)
+        except Exception:
+            pass
+    return _DEFAULT_CLOCK_COLOR
+
+def _scale(c, f):
+    """Scale an RGB tuple by factor f (for dim tracks / bright heads)."""
+    return tuple(max(0, min(255, int(v * f))) for v in c)
+
+def _clk_date_str(dt):
+    """Compact date like 'MON JUN 30' for the optional date line."""
+    return f"{dt:%a %b} {dt.day}".upper()
 
 _clock_settings_cache = None
 _clock_settings_cache_time = 0.0
@@ -1372,11 +1398,12 @@ def _load_clock_settings():
     global _clock_settings_cache, _clock_settings_cache_time
     if _clock_settings_cache is not None and time.time() - _clock_settings_cache_time < 2.0:
         return _clock_settings_cache
-    result = {"mode": "single", "zones": list(_DEFAULT_CLOCK_ZONES)}
+    result = {"mode": "single", "zones": list(_DEFAULT_CLOCK_ZONES),
+              "color": list(_DEFAULT_CLOCK_COLOR), "show_date": False}
     try:
         if os.path.exists(CLOCK_SETTINGS_FILE):
             data = json.loads(open(CLOCK_SETTINGS_FILE).read())
-            if data.get("mode") in ("single", "quad"):
+            if data.get("mode") in ("single", "quad", "analog"):
                 result["mode"] = data["mode"]
             z = data.get("zones")
             if isinstance(z, list) and z:
@@ -1384,6 +1411,13 @@ def _load_clock_settings():
                          if isinstance(e, (list, tuple)) and len(e) >= 2]
                 if zones:
                     result["zones"] = zones
+            c = data.get("color")
+            if isinstance(c, (list, tuple)) and len(c) == 3:
+                try:
+                    result["color"] = [max(0, min(255, int(v))) for v in c]
+                except Exception:
+                    pass
+            result["show_date"] = bool(data.get("show_date"))
     except Exception:
         pass  # any read/parse error → safe defaults
     _clock_settings_cache = result
@@ -1423,39 +1457,100 @@ def _ring_progress(draw, x0, y0, x1, y1, frac, color):
         lit -= seg
     return tip
 
-def render_clock_single():
-    """Big bold Eastern H:MM centred, with a thin border bar that sweeps
-    smoothly around the frame once per minute (a glowing 'second hand')."""
+def render_clock_single(s=None):
+    """Big bold H:MM centred, with a thin border bar that sweeps smoothly around
+    the frame once per minute (a glowing 'second hand'). The accent colour and an
+    optional date line are configurable via the web Clock Style settings."""
+    s = s or {}
     img = Image.new("RGB", (MATRIX_WIDTH, MATRIX_HEIGHT), (0, 0, 0))
     draw = ImageDraw.Draw(img)
     try:
-        dt = datetime.now(ZoneInfo(SINGLE_CLOCK_TZ))
+        dt = datetime.now(ZoneInfo(_single_clock_tz()))
     except Exception:
         dt = datetime.now()
     h12  = dt.hour % 12 or 12
     tstr = str(h12) + ":" + ("%02d" % dt.minute)
     ampm = "AM" if dt.hour < 12 else "PM"
     frac = (dt.second + dt.microsecond / 1e6) / 60.0   # 0..1 around the minute
+    show_date = bool(s.get("show_date"))
 
     W, H = MATRIX_WIDTH, MATRIX_HEIGHT
-    track = (14, 22, 34)        # dim full-border "track"
-    bar   = (0, 170, 255)       # swept portion (cyan)
-    head  = (210, 245, 255)     # bright leading head
+    accent = _clk_accent(s)
+    track  = _scale(accent, 0.13)        # dim full-border "track"
+    head   = _scale(accent, 0.30)
+    head   = tuple(min(255, v + 180) for v in head)   # bright leading head
 
     # Dim 2px track around the whole frame.
     draw.rectangle([(0, 0), (W - 1, H - 1)], outline=track)
     draw.rectangle([(1, 1), (W - 2, H - 2)], outline=track)
     # Bright swept portion (two concentric rings = 2px thick) + glow head.
-    tip = _ring_progress(draw, 0, 0, W - 1, H - 1, frac, bar)
-    _ring_progress(draw, 1, 1, W - 2, H - 2, frac, bar)
+    tip = _ring_progress(draw, 0, 0, W - 1, H - 1, frac, accent)
+    _ring_progress(draw, 1, 1, W - 2, H - 2, frac, accent)
     if frac > 0:
         draw.ellipse([(tip[0] - 1, tip[1] - 1), (tip[0] + 1, tip[1] + 1)], fill=head)
 
-    # Big bold time, centred and nudged up to leave room for AM/PM.
-    f = _best_clock_font(draw, tstr, W - 8)
-    draw.text((W // 2, H // 2 - 4), tstr, font=f, fill=(255, 255, 255), anchor="mm")
-    # AM/PM in the bar colour to tie the design together (subtle, below the time).
-    draw.text((W // 2, H // 2 + 13), ampm, font=get_font(7), fill=(90, 150, 200), anchor="mm")
+    if show_date:
+        # Time nudged up; AM/PM mid; date along the bottom.
+        f = _best_clock_font(draw, tstr, W - 8)
+        draw.text((W // 2, 25), tstr, font=f, fill=accent, anchor="mm")
+        draw.text((W // 2, 42), ampm, font=get_font(7), fill=_scale(accent, 0.6), anchor="mm")
+        draw.text((W // 2, 56), _clk_date_str(dt), font=get_font(6),
+                  fill=_scale(accent, 0.85), anchor="mm")
+    else:
+        f = _best_clock_font(draw, tstr, W - 8)
+        draw.text((W // 2, H // 2 - 4), tstr, font=f, fill=accent, anchor="mm")
+        draw.text((W // 2, H // 2 + 13), ampm, font=get_font(7),
+                  fill=_scale(accent, 0.6), anchor="mm")
+    return img
+
+def render_clock_analog(s=None):
+    """Analog clock face with smoothly sweeping hands. The hour/minute hands and
+    tick ring use the configured accent colour; an optional date line shows along
+    the bottom. Smoothness comes from the per-frame animation loop (~20fps) plus
+    sub-second hand angles."""
+    s = s or {}
+    img = Image.new("RGB", (MATRIX_WIDTH, MATRIX_HEIGHT), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    try:
+        dt = datetime.now(ZoneInfo(_single_clock_tz()))
+    except Exception:
+        dt = datetime.now()
+
+    W, H = MATRIX_WIDTH, MATRIX_HEIGHT
+    cx, cy = W // 2, H // 2
+    R = 30
+    accent = _clk_accent(s)
+
+    # ── Tick ring: 12 marks, longer/brighter at the quarters ──
+    for i in range(12):
+        ang = i / 12.0 * 2 * math.pi
+        sinA, cosA = math.sin(ang), math.cos(ang)
+        major = (i % 3 == 0)
+        r_in = R - (6 if major else 3)
+        col  = accent if major else _scale(accent, 0.5)
+        draw.line([(cx + sinA * r_in, cy - cosA * r_in),
+                   (cx + sinA * R,    cy - cosA * R)], fill=col, width=1)
+
+    sec  = dt.second + dt.microsecond / 1e6
+    mins = dt.minute + sec / 60.0
+    hrs  = (dt.hour % 12) + mins / 60.0
+
+    def hand(frac, length, color, width):
+        ang = frac * 2 * math.pi
+        x = cx + math.sin(ang) * length
+        y = cy - math.cos(ang) * length
+        draw.line([(cx, cy), (x, y)], fill=color, width=width)
+
+    # Hour (short, bright white), minute (accent), second (thin, dim accent).
+    hand(hrs / 12.0,  14, (255, 255, 255),       3)
+    hand(mins / 60.0, 22, accent,                 2)
+    hand(sec / 60.0,  26, _scale(accent, 0.75),   1)
+    # Hub.
+    draw.ellipse([(cx - 2, cy - 2), (cx + 2, cy + 2)], fill=(255, 255, 255))
+
+    if bool(s.get("show_date")):
+        draw.text((cx, H - 5), _clk_date_str(dt), font=get_font(6),
+                  fill=_scale(accent, 0.85), anchor="mm")
     return img
 
 def render_clock_quad(zones):
@@ -1487,12 +1582,16 @@ def render_clock():
     """Dispatch to the single-zone (Eastern + seconds bar) or 4-zone grid based
     on the web-controlled clock setting."""
     s = _load_clock_settings()
-    if s.get("mode") == "quad":
+    mode = s.get("mode")
+    if mode == "quad":
         return render_clock_quad(s.get("zones"))
-    return render_clock_single()
+    if mode == "analog":
+        return render_clock_analog(s)
+    return render_clock_single(s)
 
 def clock_is_single():
-    """True when the clock slide is in single-Eastern (animated) mode."""
+    """True when the clock slide is in an animated mode (single digital or analog,
+    both of which sweep sub-second). The 4-zone grid ticks once per second instead."""
     return _load_clock_settings().get("mode") != "quad"
 
 def animate_clock_frames(duration=0.6, fps=20):

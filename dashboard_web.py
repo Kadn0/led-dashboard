@@ -75,12 +75,14 @@ CLOCK_TZ_OPTIONS = [
 _VALID_TZS = {tz for (_n, _l, tz) in CLOCK_TZ_OPTIONS}
 
 def get_clock_settings():
-    """Returns {"mode": "single"|"quad", "zones": [[label, tz], ...4]}."""
-    result = {"mode": "single", "zones": [list(z) for z in _DEFAULT_CLOCK_ZONES]}
+    """Returns {"mode": "single"|"quad"|"analog", "zones": [[label,tz],...4],
+    "color": [r,g,b], "show_date": bool}."""
+    result = {"mode": "single", "zones": [list(z) for z in _DEFAULT_CLOCK_ZONES],
+              "color": [0, 190, 255], "show_date": False}
     try:
         if os.path.exists(CLOCK_SETTINGS_FILE):
             data = json.loads(open(CLOCK_SETTINGS_FILE).read())
-            if data.get("mode") in ("single", "quad"):
+            if data.get("mode") in ("single", "quad", "analog"):
                 result["mode"] = data["mode"]
             z = data.get("zones")
             if isinstance(z, list) and z:
@@ -88,6 +90,13 @@ def get_clock_settings():
                          if isinstance(e, (list, tuple)) and len(e) >= 2]
                 if zones:
                     result["zones"] = zones
+            c = data.get("color")
+            if isinstance(c, (list, tuple)) and len(c) == 3:
+                try:
+                    result["color"] = [max(0, min(255, int(v))) for v in c]
+                except Exception:
+                    pass
+            result["show_date"] = bool(data.get("show_date"))
     except Exception:
         pass
     return result
@@ -785,9 +794,26 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
   <div class="section-title">// Clock Style</div>
   <div class="card">
     <div class="row" style="gap:8px;margin-bottom:14px">
-      <button class="btn-ghost" id="clkModeSingle" onclick="setClockMode('single')" style="flex:1">Single — Eastern</button>
-      <button class="btn-ghost" id="clkModeQuad" onclick="setClockMode('quad')" style="flex:1">4 Time Zones</button>
+      <button class="btn-ghost" id="clkModeSingle" onclick="setClockMode('single')" style="flex:1">Digital</button>
+      <button class="btn-ghost" id="clkModeAnalog" onclick="setClockMode('analog')" style="flex:1">Analog</button>
+      <button class="btn-ghost" id="clkModeQuad" onclick="setClockMode('quad')" style="flex:1">4 Zones</button>
     </div>
+
+    <!-- Single / Analog styling (colour + date) -->
+    <div id="clkStyle" style="display:none">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;flex-wrap:wrap">
+        <div style="font-size:13px;color:var(--text)">Colour</div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span id="clkSwatches" style="display:flex;gap:6px"></span>
+          <input type="color" id="clkColor" value="#00beff" onchange="onClockColor(this.value)" title="Custom colour" style="width:38px;height:28px;background:none;border:1px solid var(--border);border-radius:6px;padding:0;cursor:pointer">
+        </div>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+        <div style="font-size:13px;color:var(--text)">Show date</div>
+        <button class="btn-ghost btn-icon" id="clkDateToggle" onclick="toggleClockDate()" style="min-width:64px">Off</button>
+      </div>
+    </div>
+
     <div id="clkZones" style="display:none">
       <div style="font-size:11px;color:var(--muted);margin-bottom:8px;letter-spacing:1px">PICK FOUR ZONES (top-left, top-right, bottom-left, bottom-right)</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
@@ -1901,6 +1927,13 @@ let clockOptions = [];     // [[name, label, tz], ...]
 let clockMode = 'single';
 let clockZones = [];       // [[label, tz], ...4]
 
+let clockColor = [0,190,255];       // accent for single/analog
+let clockShowDate = false;
+const CLOCK_PRESETS = ['#FFFFFF','#00BEFF','#FF3344','#00FF88','#FFAA00','#FF55CC'];
+
+function _hexToRgb(h){ h=h.replace('#',''); return [parseInt(h.slice(0,2),16),parseInt(h.slice(2,4),16),parseInt(h.slice(4,6),16)]; }
+function _rgbToHex(c){ return '#'+c.map(v=>Math.max(0,Math.min(255,v|0)).toString(16).padStart(2,'0')).join(''); }
+
 async function loadClockSettings() {
   try {
     const r = await fetch('/api/clock_settings');
@@ -1908,7 +1941,8 @@ async function loadClockSettings() {
     clockOptions = d.options || [];
     clockMode = d.mode || 'single';
     clockZones = d.zones || [];
-    // Populate the four dropdowns from the option list
+    clockColor = (Array.isArray(d.color) && d.color.length===3) ? d.color : [0,190,255];
+    clockShowDate = !!d.show_date;
     for (let i = 0; i < 4; i++) {
       const sel = document.getElementById('clkTz' + i);
       if (!sel) continue;
@@ -1917,17 +1951,37 @@ async function loadClockSettings() {
       const z = clockZones[i];
       if (z) sel.value = z[0] + '|' + z[1];
     }
+    renderClockSwatches();
     renderClockMode();
   } catch (e) {}
 }
 
+function renderClockSwatches() {
+  const wrap = document.getElementById('clkSwatches'); if (!wrap) return;
+  const cur = _rgbToHex(clockColor).toUpperCase();
+  wrap.innerHTML = '';
+  CLOCK_PRESETS.forEach(hex => {
+    const b = document.createElement('span');
+    const on = hex.toUpperCase() === cur;
+    b.style.cssText = `width:18px;height:18px;border-radius:50%;cursor:pointer;background:${hex};`
+      + `border:2px solid ${on?'#fff':'rgba(255,255,255,.25)'};box-shadow:${on?'0 0 6px '+hex:'none'}`;
+    b.onclick = () => onClockColor(hex);
+    wrap.appendChild(b);
+  });
+  const ci = document.getElementById('clkColor'); if (ci) ci.value = _rgbToHex(clockColor);
+}
+
 function renderClockMode() {
-  const single = document.getElementById('clkModeSingle');
-  const quad = document.getElementById('clkModeQuad');
+  ['single','analog','quad'].forEach(m => {
+    const el = document.getElementById('clkMode' + m.charAt(0).toUpperCase() + m.slice(1));
+    if (el) el.classList.toggle('active', clockMode === m);
+  });
+  const style = document.getElementById('clkStyle');
   const zones = document.getElementById('clkZones');
-  if (single) single.classList.toggle('active', clockMode === 'single');
-  if (quad) quad.classList.toggle('active', clockMode === 'quad');
+  if (style) style.style.display = (clockMode === 'quad') ? 'none' : 'block';
   if (zones) zones.style.display = (clockMode === 'quad') ? 'block' : 'none';
+  const dt = document.getElementById('clkDateToggle');
+  if (dt) { dt.textContent = clockShowDate ? 'On' : 'Off'; dt.classList.toggle('active', clockShowDate); }
 }
 
 function _collectClockZones() {
@@ -1942,14 +1996,29 @@ function _collectClockZones() {
 
 async function _saveClock() {
   await fetch('/api/clock_settings', {method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({mode: clockMode, zones: _collectClockZones()})});
+    body: JSON.stringify({mode: clockMode, zones: _collectClockZones(),
+                          color: clockColor, show_date: clockShowDate})});
 }
 
 async function setClockMode(mode) {
   clockMode = mode;
   renderClockMode();
   await _saveClock();
-  showToast(mode === 'single' ? 'Clock: single Eastern' : 'Clock: 4 time zones');
+  showToast(mode==='single' ? 'Clock: digital' : mode==='analog' ? 'Clock: analog' : 'Clock: 4 time zones');
+}
+
+async function onClockColor(hex) {
+  clockColor = _hexToRgb(hex);
+  renderClockSwatches();
+  await _saveClock();
+  showToast('Clock colour updated');
+}
+
+async function toggleClockDate() {
+  clockShowDate = !clockShowDate;
+  renderClockMode();
+  await _saveClock();
+  showToast(clockShowDate ? 'Date shown' : 'Date hidden');
 }
 
 async function saveClockZones() {
@@ -2280,7 +2349,7 @@ def api_clock_settings():
     if request.method == "POST":
         data = request.get_json(force=True) or {}
         mode = data.get("mode")
-        if mode not in ("single", "quad"):
+        if mode not in ("single", "quad", "analog"):
             return ('', 400)
         out = {"mode": mode}
         # Validate the 4 zones against the known timezone list; fall back to the
@@ -2296,6 +2365,16 @@ def api_clock_settings():
                 lbl, tz = _DEFAULT_CLOCK_ZONES[i]
             zones.append([lbl, tz])
         out["zones"] = zones
+        # Accent colour (single/analog) — clamp to [0,255], default cyan.
+        color_in = data.get("color")
+        color = [0, 190, 255]
+        if isinstance(color_in, (list, tuple)) and len(color_in) == 3:
+            try:
+                color = [max(0, min(255, int(v))) for v in color_in]
+            except Exception:
+                pass
+        out["color"] = color
+        out["show_date"] = bool(data.get("show_date"))
         tmp = CLOCK_SETTINGS_FILE + ".tmp"
         with open(tmp, "w") as f:
             json.dump(out, f)
