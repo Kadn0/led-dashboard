@@ -1,0 +1,31 @@
+# This git repo lives in the home directory, which contains private keys,
+# credentials, shell history and runtime caches. To prevent any accidental
+# `git add -A` from publishing secrets, ignore EVERYTHING by default and only
+# allow the dashboard source files through explicitly.
+
+/*
+
+# --- tracked source files (whitelist) ---
+!/.gitignore
+!/dashboard.py
+!/dashboard_config.py
+!/dashboard_web.py
+!/scan_airplay.py
+!/spotify_auth.py
+!/spotify_display.py
+
+# Belt-and-suspenders: never allow these even if whitelisted above by mistake
+.git-credentials
+.gitconfig
+.ssh/
+.bash_history
+.claude.json
+.claude/
+*.pem
+*.key
+dashboard_*.json
+manual_track.json
+.spotify_display.conf
+.spotify_display_cache/
+.dashboard_cache/
+dashboard_photos/
