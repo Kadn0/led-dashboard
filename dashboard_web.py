@@ -2664,7 +2664,21 @@ def _spotify_health():
     if sc == 204:
         return {"state": "ok", "message": "Connected — nothing playing"}
     if sc == 403:
-        return {"state": "forbidden", "message": "Authorised but blocked — check the app's scope / Dev-mode users"}
+        reason = ""
+        try:
+            reason = ((r.json() or {}).get("error") or {}).get("message", "") or ""
+        except Exception:
+            pass
+        low = reason.lower()
+        if "premium" in low:
+            return {"state": "forbidden",
+                    "message": "Spotify Premium required — the app owner's Spotify account must have an active Premium subscription"}
+        if "scope" in low:
+            return {"state": "forbidden",
+                    "message": "Missing scope — click Re-authenticate and approve the consent screen"}
+        extra = f" ({reason})" if reason else ""
+        return {"state": "forbidden",
+                "message": f"Authorised but blocked{extra} — add your Spotify account under the app's Users & Access, then re-authenticate"}
     if sc == 401:
         return {"state": "invalid", "message": "Token expired — re-authenticate"}
     if sc == 429:
@@ -2947,6 +2961,10 @@ def spotify_setup():
             f"&redirect_uri={_urlquote(redirect_uri)}"
             f"&scope={_urlquote(_SPOTIFY_SCOPE)}"
             f"&state={state}"
+            # Force the consent screen so re-authorising actually re-grants the
+            # scope — otherwise Spotify silently reissues the old (scopeless)
+            # token and currently-playing keeps returning 403.
+            f"&show_dialog=true"
         )
         return redirect(auth_url)
 
