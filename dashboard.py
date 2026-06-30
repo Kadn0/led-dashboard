@@ -762,22 +762,35 @@ class WeatherClient:
             try: lbl = "Now" if i == 0 else day_names[datetime.fromisoformat(day["date"]).weekday()]
             except Exception: lbl = "?"
             # midday hourly slot (index 4 = 12:00) for the day icon code
-            raw_code = int((day.get("hourly") or [{}]*5)[4].get("weatherCode", 113))
+            hr = (day.get("hourly") or [{}]*5)[4]
+            raw_code = self._WTTR_TO_WMO.get(int(hr.get("weatherCode", 113)), 0)
+            # Same precip-chance + cloud-cover sanity check as open-meteo.
+            try: pp = float(hr.get("chanceofrain", 0))
+            except Exception: pp = 0
+            try: cc = float(hr.get("cloudcover", 0))
+            except Exception: cc = 0
             days.append({"label": lbl,
                          "high": float(day["maxtempF"]),
                          "low":  float(day["mintempF"]),
-                         "code": self._WTTR_TO_WMO.get(raw_code, 0)})
+                         "code": self._derive_code(raw_code, pp, cc)})
         # expand 8 three-hour UV samples → 24 hourly by repeating each 3×
         hourly_uv = []
         for h in (j.get("weather") or [{}])[0].get("hourly", []):
             val = float(h.get("uvIndex", 0))
             hourly_uv += [val, val, val]
         hourly_uv = (hourly_uv + [0]*24)[:24]
-        raw_cur_code = int(cur.get("weatherCode", 113))
+        raw_cur_code = self._WTTR_TO_WMO.get(int(cur.get("weatherCode", 113)), 0)
+        try: cur_cloud = float(cur.get("cloudcover", 0))
+        except Exception: cur_cloud = 0
+        try: cur_precip_in = float(cur.get("precipInches", 0))
+        except Exception: cur_precip_in = 0
+        # If it's actively precipitating now, treat as 100% chance; else 0 and let
+        # cloud cover decide (mirrors the open-meteo derivation).
+        cur_code = self._derive_code(raw_cur_code, 100 if cur_precip_in > 0.01 else 0, cur_cloud)
         return {
             "current_temp":       float(cur["temp_F"]),
             "current_feels":      float(cur["FeelsLikeF"]),
-            "current_code":       self._WTTR_TO_WMO.get(raw_cur_code, 0),
+            "current_code":       cur_code,
             "current_uv":         float(cur.get("uvIndex", 0)),
             "current_humidity":   float(cur.get("humidity", 0)),
             "current_wind_speed": float(cur.get("windspeedMiles", 0)),
@@ -786,6 +799,26 @@ class WeatherClient:
             "days": days,
             "hourly_uv": hourly_uv,
         }
+    @staticmethod
+    def _derive_code(raw, precip_prob, cloud):
+        """Pick a sensible icon code. open-meteo's weather_code badly over-reports
+        thunderstorms on dry days (e.g. code 95 with 1% precip chance and 9%
+        cloud), so we trust the actual precipitation probability and cloud cover
+        instead. Returns a WMO code understood by draw_small_weather_icon."""
+        raw = raw or 0
+        pp = precip_prob if precip_prob is not None else 0
+        cc = cloud if cloud is not None else 0
+        # Only show wet weather when there's a real chance of precip.
+        if pp >= 40 and raw >= 45:
+            # A "slight chance" storm shouldn't render as a full thunderstorm.
+            if raw in (95, 96, 99) and pp < 60:
+                return 63          # show rain instead
+            return raw
+        # Dry: choose clear / partly-cloudy / cloudy purely from cloud cover.
+        if cc < 25: return 0       # clear
+        if cc < 60: return 2       # partly cloudy
+        return 3                   # cloudy
+
     def fetch(self):
         now = time.time()
         if self.cache and now - self.cache_time < WEATHER_POLL_INTERVAL:
@@ -796,8 +829,8 @@ class WeatherClient:
         try:
             url = ("https://api.open-meteo.com/v1/forecast?latitude="+str(CHATTANOOGA_LAT)+
                    "&longitude="+str(CHATTANOOGA_LON)+
-                   "&current=temperature_2m,apparent_temperature,weather_code,uv_index,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation"+
-                   "&daily=temperature_2m_max,temperature_2m_min,weather_code"+
+                   "&current=temperature_2m,apparent_temperature,weather_code,uv_index,relative_humidity_2m,wind_speed_10m,wind_direction_10m,precipitation,cloud_cover"+
+                   "&daily=temperature_2m_max,temperature_2m_min,weather_code,precipitation_probability_max,cloud_cover_mean"+
                    "&hourly=uv_index"+
                    "&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone="+LOCATION_TZ+"&forecast_days=3")
             r = _session.get(url, timeout=5); r.raise_for_status()
@@ -807,18 +840,29 @@ class WeatherClient:
             day_names = ["MON","TUE","WED","THU","FRI","SAT","SUN"]
             ta = daily.get("time",[]); ha = daily.get("temperature_2m_max",[])
             la = daily.get("temperature_2m_min",[]); ca = daily.get("weather_code",[])
+            pa = daily.get("precipitation_probability_max",[])   # % chance of rain
+            cca = daily.get("cloud_cover_mean",[])               # mean cloud cover %
             days = []
             for i in range(min(3, len(ta))):
                 try:
                     dt = datetime.fromisoformat(ta[i])
                     lbl = "Now" if i == 0 else day_names[dt.weekday()]
                 except Exception: lbl = "?"
+                # Derive the icon from real precip chance + cloud cover, not the
+                # unreliable raw weather_code (which over-reports storms).
+                code = self._derive_code(ca[i] if i < len(ca) else None,
+                                         pa[i] if i < len(pa) else None,
+                                         cca[i] if i < len(cca) else None)
                 days.append({"label":lbl,"high":ha[i] if i<len(ha) else None,
                             "low":la[i] if i<len(la) else None,
-                            "code":ca[i] if i<len(ca) else None})
+                            "code":code})
+            # Current conditions: use today's precip chance + the current cloud cover.
+            cur_code = self._derive_code(cur.get("weather_code"),
+                                         pa[0] if pa else None,
+                                         cur.get("cloud_cover"))
             self.cache = {"current_temp":cur.get("temperature_2m"),
                          "current_feels":cur.get("apparent_temperature"),
-                         "current_code":cur.get("weather_code"),
+                         "current_code":cur_code,
                          "current_uv":cur.get("uv_index"),
                          "current_humidity":cur.get("relative_humidity_2m"),
                          "current_wind_speed":cur.get("wind_speed_10m"),
@@ -1345,20 +1389,7 @@ def _load_clock_settings():
     _clock_settings_cache_time = time.time()
     return result
 
-def _perimeter_points(W, H):
-    """Ordered list of border pixels, clockwise from the top-left corner."""
-    pts = []
-    for x in range(W):            pts.append((x, 0))        # top:    L → R
-    for y in range(1, H):         pts.append((W-1, y))      # right:  T → B
-    for x in range(W-2, -1, -1):  pts.append((x, H-1))      # bottom: R → L
-    for y in range(H-2, 0, -1):   pts.append((0, y))        # left:   B → T
-    return pts
-
-# Cache the two perimeter rings (outer edge + 1px inset) so the border bar is
-# a crisp 2px-thick ring without recomputing the path every frame.
-_PERIM_RINGS = None
-
-def _best_clock_font(draw, text, max_w, sizes=(22, 20, 18, 16, 14)):
+def _best_clock_font(draw, text, max_w, sizes=(24, 22, 20, 18, 16, 14)):
     """Largest font from `sizes` whose rendered width fits within max_w."""
     for s in sizes:
         f = get_font(s)
@@ -1367,9 +1398,33 @@ def _best_clock_font(draw, text, max_w, sizes=(22, 20, 18, 16, 14)):
             return f
     return get_font(sizes[-1])
 
+def _ring_progress(draw, x0, y0, x1, y1, frac, color):
+    """Draw `frac` (0..1) of a rectangular border, clockwise from the top-left,
+    using one line per edge (sub-pixel smooth, very cheap). Returns the tip
+    (x, y) of the leading edge so the caller can add a glow head."""
+    w, h = x1 - x0, y1 - y0
+    edges = [((x0, y0), (x1, y0), w),   # top    →
+             ((x1, y0), (x1, y1), h),   # right  ↓
+             ((x1, y1), (x0, y1), w),   # bottom ←
+             ((x0, y1), (x0, y0), h)]   # left   ↑
+    total = 2 * (w + h)
+    lit = frac * total
+    tip = (x0, y0)
+    for (ax, ay), (bx, by), length in edges:
+        if lit <= 0 or length <= 0:
+            continue
+        seg = min(lit, length)
+        t = seg / length
+        ex = round(ax + (bx - ax) * t)
+        ey = round(ay + (by - ay) * t)
+        draw.line([(ax, ay), (ex, ey)], fill=color)
+        tip = (ex, ey)
+        lit -= seg
+    return tip
+
 def render_clock_single():
-    """Big bold Eastern HH:MM centred, with a border bar that fills once per
-    minute to reflect the seconds (like a second hand sweeping the frame)."""
+    """Big bold Eastern H:MM centred, with a thin border bar that sweeps
+    smoothly around the frame once per minute (a glowing 'second hand')."""
     img = Image.new("RGB", (MATRIX_WIDTH, MATRIX_HEIGHT), (0, 0, 0))
     draw = ImageDraw.Draw(img)
     try:
@@ -1381,27 +1436,25 @@ def render_clock_single():
     ampm = "AM" if dt.hour < 12 else "PM"
     frac = (dt.second + dt.microsecond / 1e6) / 60.0   # 0..1 around the minute
 
-    # ── Seconds border bar: dim full ring, bright fill up to `frac`, 2px thick ──
-    global _PERIM_RINGS
-    if _PERIM_RINGS is None:
-        outer = _perimeter_points(MATRIX_WIDTH, MATRIX_HEIGHT)
-        inner = [(x + 1, y + 1) for (x, y) in _perimeter_points(MATRIX_WIDTH - 2, MATRIX_HEIGHT - 2)]
-        _PERIM_RINGS = (outer, inner)
-    bar_col, dim_col = (0, 180, 255), (22, 32, 48)
-    for ring in _PERIM_RINGS:
-        for (x, y) in ring:
-            draw.point((x, y), fill=dim_col)
-        lit = int(frac * len(ring))
-        for i in range(lit):
-            draw.point(ring[i], fill=bar_col)
+    W, H = MATRIX_WIDTH, MATRIX_HEIGHT
+    track = (14, 22, 34)        # dim full-border "track"
+    bar   = (0, 170, 255)       # swept portion (cyan)
+    head  = (210, 245, 255)     # bright leading head
 
-    # ── Big bold time, centred ──
-    f = _best_clock_font(draw, tstr, MATRIX_WIDTH - 8)
-    draw.text((MATRIX_WIDTH // 2, MATRIX_HEIGHT // 2 - 3), tstr,
-              font=f, fill=(255, 255, 255), anchor="mm")
-    # Small AM/PM beneath so 9am/9pm aren't ambiguous (kept subtle).
-    draw.text((MATRIX_WIDTH // 2, MATRIX_HEIGHT // 2 + 13), ampm,
-              font=get_font(7), fill=(110, 140, 180), anchor="mm")
+    # Dim 2px track around the whole frame.
+    draw.rectangle([(0, 0), (W - 1, H - 1)], outline=track)
+    draw.rectangle([(1, 1), (W - 2, H - 2)], outline=track)
+    # Bright swept portion (two concentric rings = 2px thick) + glow head.
+    tip = _ring_progress(draw, 0, 0, W - 1, H - 1, frac, bar)
+    _ring_progress(draw, 1, 1, W - 2, H - 2, frac, bar)
+    if frac > 0:
+        draw.ellipse([(tip[0] - 1, tip[1] - 1), (tip[0] + 1, tip[1] + 1)], fill=head)
+
+    # Big bold time, centred and nudged up to leave room for AM/PM.
+    f = _best_clock_font(draw, tstr, W - 8)
+    draw.text((W // 2, H // 2 - 4), tstr, font=f, fill=(255, 255, 255), anchor="mm")
+    # AM/PM in the bar colour to tie the design together (subtle, below the time).
+    draw.text((W // 2, H // 2 + 13), ampm, font=get_font(7), fill=(90, 150, 200), anchor="mm")
     return img
 
 def render_clock_quad(zones):
@@ -1436,6 +1489,29 @@ def render_clock():
     if s.get("mode") == "quad":
         return render_clock_quad(s.get("zones"))
     return render_clock_single()
+
+def clock_is_single():
+    """True when the clock slide is in single-Eastern (animated) mode."""
+    return _load_clock_settings().get("mode") != "quad"
+
+def animate_clock_frames(duration=0.6, fps=20):
+    """Render the single clock smoothly for ~`duration` seconds, then yield back
+    to the main loop so interrupts/slot timing are re-checked. Uses absolute-time
+    scheduling: the frame send (_send_raw) blocks until the panel's next vsync, so
+    stacking a fixed sleep on top produced an uneven cadence (visible stutter).
+    Here each frame targets a fixed wall-clock slot and we only sleep for the time
+    that's actually left, giving a steady, even sweep."""
+    interval = 1.0 / fps
+    end  = time.time() + duration
+    nextf = time.time()
+    while time.time() < end:
+        display_pil_image(render_clock())
+        nextf += interval
+        rem = nextf - time.time()
+        if rem > 0:
+            time.sleep(rem)
+        else:
+            nextf = time.time()   # fell behind — resync rather than burst-catch-up
 
 def render_weather(weather, aqi_data=None, frame=0):
     img = Image.new("RGB",(MATRIX_WIDTH,MATRIX_HEIGHT),(0,0,0))
@@ -3078,6 +3154,10 @@ def main():
                         last_render = 0
 
                     if cs_slot == "clock":
+                        if clock_is_single():
+                            last_clock_tick = now; last_render = now
+                            animate_clock_frames()
+                            continue   # smooth bar; skip the shared 0.5s sleep below
                         if now - last_clock_tick >= CLOCK_REFRESH_INTERVAL:
                             display_pil_image(render_clock())
                             last_clock_tick = now; last_render = now
@@ -3541,6 +3621,13 @@ def main():
                         do_transition(_rimg)
 
                 if cs_slot == "clock":
+                    if clock_is_single():
+                        # Smooth sweeping seconds bar — animate a short batch then
+                        # loop back (skips the trailing 0.5s sleep via continue).
+                        if last_render == 0: print("CYCLE: clock")
+                        last_render = now; last_clock_tick = now
+                        animate_clock_frames()
+                        continue
                     if now - last_clock_tick >= CLOCK_REFRESH_INTERVAL:
                         if last_render == 0: print("CYCLE: clock")
                         display_pil_image(render_clock())

@@ -267,17 +267,29 @@ HTML = r"""<!DOCTYPE html>
 body {
   font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif;
   background-color:var(--bg);
-  background-image:radial-gradient(circle,#0d1520 1.2px,transparent 1.2px);
-  background-size:5px 5px; color:var(--text); min-height:100vh;
+  background-image:
+    radial-gradient(1100px 520px at 50% -8%, rgba(34,136,255,.07), transparent 62%),
+    radial-gradient(circle,#0d1520 1.2px,transparent 1.2px);
+  background-size:100% 100%, 5px 5px;
+  background-attachment:fixed, scroll;
+  color:var(--text); min-height:100vh;
   padding:env(safe-area-inset-top,0) 0 env(safe-area-inset-bottom,48px);
 }
 
-/* ── Page wrapper ── */
-.page-wrap { width:100%; }
+/* ── Page wrapper (centred, capped width on big screens) ── */
+.page-wrap { width:100%; max-width:1340px; margin:0 auto; }
+/* Tabs styled as a segmented control */
+.tabnav { display:inline-flex; gap:4px; margin:2px var(--pad) 18px; padding:5px; background:var(--surface); border:1px solid var(--border); border-radius:13px; }
+.tab-btn { background:transparent; border:1px solid transparent; color:var(--muted); border-radius:9px; padding:9px 22px; font-family:'Share Tech Mono',monospace; font-size:13px; letter-spacing:1.5px; text-transform:uppercase; cursor:pointer; transition:all .15s; }
+.tab-btn:hover { color:var(--text); }
+.tab-btn.active { background:rgba(34,136,255,.16); color:var(--cyan); border-color:rgba(0,204,255,.35); box-shadow:0 1px 8px rgba(0,204,255,.12); }
+.tab-panel { display:none; animation:fadeIn .22s ease; }
+.tab-panel.active { display:block; }
+@keyframes fadeIn { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:none} }
 
-/* ── Header ── */
-.header { display:flex; align-items:center; justify-content:space-between; padding:16px var(--pad) 12px; }
-.header-title { font-family:'Share Tech Mono',monospace; font-size:clamp(16px,4vw,22px); letter-spacing:clamp(1px,.5vw,3px); text-transform:uppercase; color:var(--red); text-shadow:0 0 6px rgba(255,34,68,.4); }
+/* ── Header (sticky app-bar) ── */
+.header { display:flex; align-items:center; justify-content:space-between; padding:15px var(--pad) 13px; position:sticky; top:0; z-index:50; background:linear-gradient(180deg, rgba(3,6,12,.96) 55%, rgba(3,6,12,.72)); backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px); border-bottom:1px solid var(--border); margin-bottom:8px; }
+.header-title { font-family:'Share Tech Mono',monospace; font-size:clamp(16px,4vw,22px); letter-spacing:clamp(1px,.5vw,3px); text-transform:uppercase; color:var(--red); text-shadow:0 0 10px rgba(255,34,68,.35); }
 .header-sub { font-size:clamp(9px,1.8vw,11px); color:var(--muted); margin-top:4px; letter-spacing:1px; text-transform:uppercase; }
 .live-badge { display:flex; align-items:center; gap:6px; background:rgba(0,255,136,.06); border:1px solid rgba(0,255,136,.2); border-radius:6px; padding:5px 10px; font-family:'Share Tech Mono',monospace; font-size:clamp(10px,2vw,12px); letter-spacing:1.5px; color:var(--green); white-space:nowrap; }
 .live-dot { width:7px; height:7px; flex-shrink:0; border-radius:50%; background:var(--green); box-shadow:0 0 5px var(--green); animation:pulse 2s ease-in-out infinite; }
@@ -311,18 +323,19 @@ body {
 }
 
 /* ── Radar map ── */
-#radarMap { border-radius:8px 8px 0 0; }
+#radarMap { border-radius:13px 13px 0 0; }
 
 /* ── Section titles ── */
-.section-title { font-family:'Share Tech Mono',monospace; font-size:12px; letter-spacing:2px; text-transform:uppercase; color:var(--muted); padding:0 2px 0 10px; margin-bottom:8px; border-left:2px solid rgba(34,136,255,.4); }
+.section-title { font-family:'Share Tech Mono',monospace; font-size:12px; letter-spacing:2px; text-transform:uppercase; color:var(--muted); padding:0 2px 0 11px; margin-bottom:10px; border-left:3px solid var(--cyan); line-height:1.4; }
 
 /* ── Cards ── */
-.card { background:var(--panel); border:1px solid var(--border); border-radius:var(--r); padding:clamp(12px,2.5vw,20px); position:relative; box-shadow:inset 0 1px 0 rgba(255,255,255,.03),0 2px 16px rgba(0,0,0,.6); transition:border-color .2s; }
-.card:hover { border-color:rgba(34,136,255,.25); }
+.card { background:linear-gradient(180deg,#0a0f17,#070a10); border:1px solid var(--border); border-radius:14px; padding:clamp(14px,2.5vw,20px); position:relative; box-shadow:inset 0 1px 0 rgba(255,255,255,.04),0 8px 24px rgba(0,0,0,.5); transition:border-color .2s, transform .2s, box-shadow .2s; }
+.card:hover { border-color:rgba(34,136,255,.28); transform:translateY(-2px); box-shadow:inset 0 1px 0 rgba(255,255,255,.05),0 14px 32px rgba(0,0,0,.6); }
 .card+.card { margin-top:var(--gap); }
 
 /* ── Buttons ── */
-button { display:inline-flex; align-items:center; justify-content:center; gap:7px; padding:11px 14px; font-size:clamp(12px,2vw,14px); font-weight:600; border:1px solid var(--border); border-radius:6px; cursor:pointer; transition:all .15s; width:100%; background:var(--surface); color:var(--text); -webkit-appearance:none; letter-spacing:.3px; }
+button { display:inline-flex; align-items:center; justify-content:center; gap:7px; padding:11px 14px; font-size:clamp(12px,2vw,14px); font-weight:600; border:1px solid var(--border); border-radius:9px; cursor:pointer; transition:all .15s; width:100%; background:var(--surface); color:var(--text); -webkit-appearance:none; letter-spacing:.3px; }
+button:hover { filter:brightness(1.12); }
 button:active { transform:scale(.96); opacity:.8; }
 .btn-primary { background:rgba(34,136,255,.15); color:var(--blue); border-color:rgba(34,136,255,.35); }
 .btn-danger  { background:rgba(255,34,68,.1); color:#ff6688; border-color:rgba(255,34,68,.3); }
@@ -553,6 +566,12 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
   <div class="live-badge"><div class="live-dot"></div>LIVE</div>
 </div>
 
+<div class="tabnav">
+  <button class="tab-btn active" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</button>
+  <button class="tab-btn" data-tab="settings" onclick="switchTab('settings')">Settings</button>
+</div>
+
+<div class="tab-panel active" id="tab-dashboard">
 <div class="dash-grid">
 
 <!-- ── Row 1: Now on Display  |  Brightness ── -->
@@ -634,6 +653,100 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
   </div>
 </div>
 
+<!-- Live Radar -->
+<div class="section">
+  <div class="section-title">// Live Radar</div>
+  <div class="card" style="padding:0;overflow:hidden;border-radius:14px">
+    <div id="radarMap" style="height:280px;width:100%"></div>
+    <div id="radarList" style="padding:12px 16px 10px"></div>
+  </div>
+</div>
+
+<!-- ── Row 3: Manual Flight Track  |  ISS + API Monitors ── -->
+
+<!-- Manual Flight Track -->
+<div class="section">
+  <div class="section-title">// Manual Flight Track</div>
+  <div class="card" id="flightCard"></div>
+</div>
+
+<!-- ISS Tracker + API Monitors stacked -->
+<div class="dash-stack">
+  <div class="section">
+    <div class="section-title">// ISS Tracker</div>
+    <div class="card" id="issCard"><div class="radar-empty">Loading…</div></div>
+  </div>
+  <div class="section">
+    <div class="section-title">// API Monitors</div>
+    <div class="monitor-grid">
+      <div class="monitor-card">
+        <div class="monitor-label"><div class="monitor-dot" id="dotWeather"></div>Weather</div>
+        <div style="display:flex;align-items:baseline;gap:8px">
+          <div class="monitor-val" id="monWeatherTemp">–</div>
+          <div style="font-size:12px;color:var(--muted)" id="monWeatherFeels"></div>
+        </div>
+        <div class="monitor-sub" id="monWeatherDesc">–</div>
+        <div class="monitor-stats" id="monWeatherStats" style="display:none">
+          <span id="monWeatherHumid"></span>
+          <span id="monWeatherWind"></span>
+          <span id="monWeatherUV"></span>
+          <span id="monWeatherPrecip"></span>
+        </div>
+        <div class="monitor-tag" id="monWeatherAge">–</div>
+      </div>
+      <div class="monitor-card">
+        <div class="monitor-label"><div class="monitor-dot" id="dotMusic"></div>Music</div>
+        <div style="display:flex;gap:10px;align-items:center;margin-bottom:6px">
+          <img id="monMusicArt" src="" alt="" style="width:48px;height:48px;border-radius:4px;object-fit:cover;background:var(--surface);display:none;flex-shrink:0;image-rendering:auto">
+          <div style="min-width:0">
+            <div class="monitor-val" id="monMusicTrack" style="font-size:15px;line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">–</div>
+            <div class="monitor-sub" id="monMusicArtist" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">–</div>
+          </div>
+        </div>
+        <div class="monitor-tag" id="monMusicSource">–</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Full width: Photos ── -->
+<div class="section dash-full">
+  <div class="section-title">// Photos</div>
+  <div class="card">
+    <div class="photos-inner">
+      <div>
+        <form id="uploadForm" onsubmit="submitUpload(event)">
+          <div class="upload-zone" id="uploadZone">
+            <input type="file" name="photos" multiple accept="image/*" id="fileInput">
+            <div class="upload-icon"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/><circle cx="12" cy="13" r="4"/></svg></div>
+            <div id="uploadLabel">Tap to add photos</div>
+            <div class="upload-hint">JPG · PNG · HEIC</div>
+          </div>
+          <button class="btn-success" type="submit">Upload to Dashboard</button>
+        </form>
+        <div id="forcedBanner" class="forced-banner">
+          <div class="forced-banner-dot" id="forcedBannerDot"></div>
+          <span class="forced-banner-label" id="forcedBannerLabel"></span>
+          <button class="forced-banner-stop" onclick="clearForcedPhoto()">Stop</button>
+        </div>
+        <div class="photo-count-bar">
+          <span id="photoCountLabel">Loading…</span>
+          <button class="btn-danger btn-icon" id="deleteAllBtn" onclick="deleteAllPhotos()" style="display:none">Delete All</button>
+        </div>
+      </div>
+      <div>
+        <div class="photo-grid" id="photoGrid"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+</div><!-- /dash-grid -->
+</div><!-- /tab-dashboard -->
+
+<div class="tab-panel" id="tab-settings">
+<div class="dash-grid">
 <!-- Auto Schedule -->
 <div class="section">
   <div class="section-title">// Auto Schedule</div>
@@ -722,97 +835,8 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
     </div>
   </div>
 </div>
-
-<!-- Live Radar -->
-<div class="section">
-  <div class="section-title">// Live Radar</div>
-  <div class="card" style="padding:0;overflow:hidden;border-radius:8px">
-    <div id="radarMap" style="height:280px;width:100%"></div>
-    <div id="radarList" style="padding:12px 16px 10px"></div>
-  </div>
-</div>
-
-<!-- ── Row 3: Manual Flight Track  |  ISS + API Monitors ── -->
-
-<!-- Manual Flight Track -->
-<div class="section">
-  <div class="section-title">// Manual Flight Track</div>
-  <div class="card" id="flightCard"></div>
-</div>
-
-<!-- ISS Tracker + API Monitors stacked -->
-<div class="dash-stack">
-  <div class="section">
-    <div class="section-title">// ISS Tracker</div>
-    <div class="card" id="issCard"><div class="radar-empty">Loading…</div></div>
-  </div>
-  <div class="section">
-    <div class="section-title">// API Monitors</div>
-    <div class="monitor-grid">
-      <div class="monitor-card">
-        <div class="monitor-label"><div class="monitor-dot" id="dotWeather"></div>Weather</div>
-        <div style="display:flex;align-items:baseline;gap:8px">
-          <div class="monitor-val" id="monWeatherTemp">–</div>
-          <div style="font-size:12px;color:var(--muted)" id="monWeatherFeels"></div>
-        </div>
-        <div class="monitor-sub" id="monWeatherDesc">–</div>
-        <div class="monitor-stats" id="monWeatherStats" style="display:none">
-          <span id="monWeatherHumid"></span>
-          <span id="monWeatherWind"></span>
-          <span id="monWeatherUV"></span>
-          <span id="monWeatherPrecip"></span>
-        </div>
-        <div class="monitor-tag" id="monWeatherAge">–</div>
-      </div>
-      <div class="monitor-card">
-        <div class="monitor-label"><div class="monitor-dot" id="dotMusic"></div>Music</div>
-        <div style="display:flex;gap:10px;align-items:center;margin-bottom:6px">
-          <img id="monMusicArt" src="" alt="" style="width:48px;height:48px;border-radius:4px;object-fit:cover;background:var(--surface);display:none;flex-shrink:0;image-rendering:auto">
-          <div style="min-width:0">
-            <div class="monitor-val" id="monMusicTrack" style="font-size:15px;line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">–</div>
-            <div class="monitor-sub" id="monMusicArtist" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">–</div>
-          </div>
-        </div>
-        <div class="monitor-tag" id="monMusicSource">–</div>
-      </div>
-    </div>
-  </div>
-</div>
-
-<!-- ── Full width: Photos ── -->
-<div class="section dash-full">
-  <div class="section-title">// Photos</div>
-  <div class="card">
-    <div class="photos-inner">
-      <div>
-        <form id="uploadForm" onsubmit="submitUpload(event)">
-          <div class="upload-zone" id="uploadZone">
-            <input type="file" name="photos" multiple accept="image/*" id="fileInput">
-            <div class="upload-icon"><svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 01-2 2H3a2 2 0 01-2-2V8a2 2 0 012-2h4l2-3h6l2 3h4a2 2 0 012 2z"/><circle cx="12" cy="13" r="4"/></svg></div>
-            <div id="uploadLabel">Tap to add photos</div>
-            <div class="upload-hint">JPG · PNG · HEIC</div>
-          </div>
-          <button class="btn-success" type="submit">Upload to Dashboard</button>
-        </form>
-        <div id="forcedBanner" class="forced-banner">
-          <div class="forced-banner-dot" id="forcedBannerDot"></div>
-          <span class="forced-banner-label" id="forcedBannerLabel"></span>
-          <button class="forced-banner-stop" onclick="clearForcedPhoto()">Stop</button>
-        </div>
-        <div class="photo-count-bar">
-          <span id="photoCountLabel">Loading…</span>
-          <button class="btn-danger btn-icon" id="deleteAllBtn" onclick="deleteAllPhotos()" style="display:none">Delete All</button>
-        </div>
-      </div>
-      <div>
-        <div class="photo-grid" id="photoGrid"></div>
-      </div>
-    </div>
-  </div>
-</div>
-
-
 </div><!-- /dash-grid -->
+</div><!-- /tab-settings -->
 </div><!-- /page-wrap -->
 
 <!-- Show Photo Modal -->
@@ -1893,6 +1917,16 @@ async function saveClockZones() {
   await _saveClock();
   showToast('Time zones saved');
 }
+
+// ── Tab switching ──────────────────────────────────────────────────────
+function switchTab(name){
+  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.toggle('active', p.id==='tab-'+name));
+  document.querySelectorAll('.tab-btn').forEach(b=>b.classList.toggle('active', b.dataset.tab===name));
+  try{ localStorage.setItem('dashTab', name); }catch(e){}
+  // Leaflet needs a nudge if its container was hidden when created
+  setTimeout(()=>window.dispatchEvent(new Event('resize')), 60);
+}
+try{ const _t=localStorage.getItem('dashTab'); if(_t && _t!=='dashboard') switchTab(_t); }catch(e){}
 
 // Init
 pollOverride(); pollFlight(); loadPhotos(); loadStatus(); pollLiveData(); loadPhotoSettings(); loadSchedule(); loadClockSettings();
