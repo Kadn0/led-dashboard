@@ -518,6 +518,16 @@ input[type=text]::placeholder { color:var(--dim); letter-spacing:1px; font-size:
 .status-row { display:flex; align-items:center; justify-content:space-between; padding:10px 0; border-bottom:1px solid var(--border); }
 .status-row:last-child { border-bottom:none; padding-bottom:0; }
 .status-label { font-family:'Share Tech Mono',monospace; font-size:12px; letter-spacing:2px; color:var(--muted); text-transform:uppercase; }
+
+/* ── System Status: compact stat chips + action grid ── */
+.sys-stats { display:grid; grid-template-columns:repeat(2,1fr); gap:8px; }
+@media(min-width:560px) { .sys-stats { grid-template-columns:repeat(3,1fr); } }
+.sys-stat { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:9px 11px; min-width:0; }
+.sys-stat .k { font-family:'Share Tech Mono',monospace; font-size:10px; letter-spacing:1.5px; color:var(--muted); text-transform:uppercase; }
+.sys-stat .v { font-size:14px; color:var(--text); margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.sys-actions { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:14px; }
+@media(max-width:440px) { .sys-actions { grid-template-columns:1fr 1fr; } }
+.sys-actions button { width:100%; }
 .status-val { font-family:'Share Tech Mono',monospace; font-size:15px; letter-spacing:1px; }
 .status-ok   { color:var(--green); }
 .status-warn { color:var(--amber); }
@@ -838,47 +848,30 @@ hr { border:none; border-top:1px solid var(--border); margin:14px 0; }
       </div>
     </div>
     <hr>
-    <div class="status-inner">
-      <div>
-        <div class="status-row">
-          <span class="status-label">Dashboard</span>
-          <span class="status-val" id="stDash">…</span>
-        </div>
-        <div class="status-row">
-          <span class="status-label">CPU Temp</span>
-          <span class="status-val" id="stTemp">…</span>
-        </div>
-        <div class="status-row">
-          <span class="status-label">Art Cache</span>
-          <span class="status-val" id="stCache">…</span>
-        </div>
-        <div class="status-row">
-          <span class="status-label">Forced Photo</span>
-          <span class="status-val" id="stForced">none</span>
-        </div>
-        <div class="status-row">
-          <span class="status-label">Slide Lock</span>
-          <span class="status-val" id="stSlide">auto</span>
-        </div>
-      </div>
-      <div style="display:flex;flex-direction:column;gap:8px">
-        <button class="btn-primary" onclick="restartService('display')">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:5px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-          Restart Display
-        </button>
-        <button class="btn-primary" onclick="restartService('web')">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:5px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-          Restart Web
-        </button>
-        <button class="btn-danger" onclick="clearArtCache()">Clear Art Cache</button>
-        <hr style="margin:4px 0">
-        <button class="btn-danger" onclick="factoryReset()" style="border-color:rgba(255,34,68,.55)">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:5px"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
-          Factory Reset
-        </button>
-        <div style="font-size:11px;color:var(--muted);text-align:center;line-height:1.4">Erases all settings &amp; returns to setup. Photos are kept.</div>
-      </div>
+    <div class="sys-stats">
+      <div class="sys-stat"><div class="k">Dashboard</div><div class="v" id="stDash">…</div></div>
+      <div class="sys-stat"><div class="k">CPU Temp</div><div class="v" id="stTemp">…</div></div>
+      <div class="sys-stat"><div class="k">Art Cache</div><div class="v" id="stCache">…</div></div>
+      <div class="sys-stat"><div class="k">Forced Photo</div><div class="v" id="stForced">none</div></div>
+      <div class="sys-stat"><div class="k">Slide Lock</div><div class="v" id="stSlide">auto</div></div>
     </div>
+    <div class="sys-actions">
+      <button class="btn-primary" onclick="restartService('display')">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:5px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        Restart Display
+      </button>
+      <button class="btn-primary" onclick="restartService('web')">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:5px"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        Restart Web
+      </button>
+      <button class="btn-danger" onclick="clearArtCache()">Clear Cache</button>
+    </div>
+    <hr style="margin:14px 0 12px">
+    <button class="btn-danger" onclick="factoryReset()" style="border-color:rgba(255,34,68,.55)">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:middle;margin-right:5px"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
+      Factory Reset
+    </button>
+    <div style="font-size:11px;color:var(--muted);text-align:center;line-height:1.4;margin-top:8px">Erases all settings &amp; returns to setup. Photos are kept.</div>
   </div>
 </div>
 </div><!-- /dash-grid -->
@@ -2020,14 +2013,16 @@ function factoryReset(){
     .catch(()=>showToast('Reset failed'));
 }
 
-// ── Spotify status ─────────────────────────────────────────────────────
+// ── Spotify status (live: token refresh + currently-playing probe) ──────
+const _SP_COLORS = { ok:'var(--green)', forbidden:'var(--amber)', unauthorized:'var(--amber)',
+                     ratelimited:'var(--amber)', invalid:'#ff6688', error:'#ff6688', none:'var(--muted)' };
 function loadSpotifyStatus(){
+  const dot=document.getElementById('spDot'), st=document.getElementById('spStatus'); if(!dot) return;
+  dot.style.background='var(--muted)'; st.textContent='Checking…';
   fetch('/api/spotify_status').then(r=>r.json()).then(d=>{
-    const dot=document.getElementById('spDot'), st=document.getElementById('spStatus'); if(!dot) return;
-    if(d.connected){ dot.style.background='var(--green)'; st.textContent='Connected'; }
-    else if(d.has_creds){ dot.style.background='var(--amber)'; st.textContent='Credentials saved — not authorised'; }
-    else { dot.style.background='var(--muted)'; st.textContent='Not connected'; }
-  }).catch(()=>{});
+    dot.style.background = _SP_COLORS[d.state] || 'var(--muted)';
+    st.textContent = d.message || 'Unknown';
+  }).catch(()=>{ st.textContent='Status check failed'; });
 }
 
 // ── Tab switching ──────────────────────────────────────────────────────
@@ -2525,18 +2520,72 @@ def _reverse_geocode(lat, lon):
         return None
 
 
+def _spotify_health():
+    """Actually validate Spotify: refresh the token and probe currently-playing,
+    so the status reflects whether the display can really read playback (not just
+    whether a token file exists)."""
+    if not _SPOTIFY_CONF.exists():
+        return {"state": "none", "message": "Not connected"}
+    try:
+        cfg = json.loads(_SPOTIFY_CONF.read_text())
+    except Exception:
+        return {"state": "none", "message": "Config unreadable"}
+
+    cid, csec, rtok = cfg.get("client_id"), cfg.get("client_secret"), cfg.get("refresh_token")
+    if not (cid and csec):
+        return {"state": "none", "message": "Not configured"}
+    if not rtok:
+        return {"state": "unauthorized", "message": "Credentials saved — not authorised yet"}
+
+    # 1) Exchange the refresh token for an access token.
+    try:
+        auth = _b64.b64encode(f"{cid}:{csec}".encode()).decode()
+        r = _req.post("https://accounts.spotify.com/api/token",
+                      headers={"Authorization": f"Basic {auth}",
+                               "Content-Type": "application/x-www-form-urlencoded"},
+                      data={"grant_type": "refresh_token", "refresh_token": rtok}, timeout=7)
+    except Exception:
+        return {"state": "error", "message": "Couldn't reach Spotify"}
+    if r.status_code != 200:
+        return {"state": "invalid", "message": "Token rejected — re-authenticate"}
+    access = r.json().get("access_token")
+    if not access:
+        return {"state": "invalid", "message": "Token rejected — re-authenticate"}
+
+    # 2) Probe the exact endpoint the display uses.
+    try:
+        r = _req.get("https://api.spotify.com/v1/me/player/currently-playing",
+                     headers={"Authorization": f"Bearer {access}"}, timeout=7)
+    except Exception:
+        return {"state": "error", "message": "Couldn't reach Spotify"}
+
+    sc = r.status_code
+    if sc == 200:
+        try:
+            d = r.json()
+            if d.get("is_playing") and d.get("item"):
+                it = d["item"]
+                artists = ", ".join(a.get("name", "") for a in it.get("artists", [])[:2])
+                track = it.get("name", "")
+                return {"state": "ok", "message": f"Playing: {track}" + (f" — {artists}" if artists else "")}
+        except Exception:
+            pass
+        return {"state": "ok", "message": "Connected — nothing playing"}
+    if sc == 204:
+        return {"state": "ok", "message": "Connected — nothing playing"}
+    if sc == 403:
+        return {"state": "forbidden", "message": "Authorised but blocked — check the app's scope / Dev-mode users"}
+    if sc == 401:
+        return {"state": "invalid", "message": "Token expired — re-authenticate"}
+    if sc == 429:
+        return {"state": "ratelimited", "message": "Rate limited — try again shortly"}
+    return {"state": "error", "message": f"Spotify error {sc}"}
+
+
 @app.route("/api/spotify_status")
 @login_required
 def api_spotify_status():
-    connected = has_creds = False
-    if _SPOTIFY_CONF.exists():
-        try:
-            d = json.loads(_SPOTIFY_CONF.read_text())
-            has_creds = bool(d.get("client_id") and d.get("client_secret"))
-            connected = bool(d.get("refresh_token"))
-        except Exception:
-            pass
-    return jsonify(connected=connected, has_creds=has_creds)
+    return jsonify(_spotify_health())
 
 
 @app.route("/api/location", methods=["GET", "POST"])

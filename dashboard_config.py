@@ -56,7 +56,9 @@ CLOCK_TIMEZONES = [
 # FLIGHT TRACKER
 # ─────────────────────────────────────────────────────────────────────────────
 FLIGHT_RADIUS_MILES        = 15    # ADS-B search radius
-FLIGHT_POLL_INTERVAL       = 5     # seconds between ADS-B polls
+FLIGHT_POLL_INTERVAL       = 3     # seconds between ADS-B polls (rotates across 3 APIs,
+                                   # so each provider is hit only ~every 9s — safe to lower.
+                                   # Floor is ~2s before airplanes.live rate-limits.)
 PLANE_DISPLAY_DURATION     = 8     # seconds a plane card stays on screen
 PLANE_REPEAT_INTERVAL      = 120   # seconds before showing the same plane again
 
