@@ -2669,6 +2669,8 @@ def _spotify_health():
             reason = ((r.json() or {}).get("error") or {}).get("message", "") or ""
         except Exception:
             pass
+        if not reason:                       # 403 body is sometimes plain text
+            reason = (r.text or "").strip()[:200]
         low = reason.lower()
         if "premium" in low:
             return {"state": "forbidden",
