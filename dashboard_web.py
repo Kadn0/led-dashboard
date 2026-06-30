@@ -20,6 +20,15 @@ import dashboard_config as _cfg   # first-run setup state (load/save/effective_*
 app = Flask(__name__)
 app.secret_key = "cf82a1d9e4b7f305c6182a3d"
 
+# Honour X-Forwarded-Proto/Host when reached through a reverse proxy / Cloudflare
+# tunnel, so request.url_root reflects the real https origin (needed because
+# Spotify requires https redirect URIs for anything but 127.0.0.1 loopback).
+try:
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
+except Exception:
+    pass
+
 _DEFAULT_SEGMENTS = [
     {"end": 6,  "bright": 0},
     {"end": 10, "bright": 35},
@@ -2808,6 +2817,9 @@ input:focus{border-color:var(--blue);}
     <input name="client_id" type="text" placeholder="e.g. 3abc…" value="{{ prefill_id }}" required autocomplete="off" autocorrect="off" autocapitalize="none">
     <label>Spotify Client Secret</label>
     <input name="client_secret" type="password" placeholder="••••••••••••••••" value="{{ prefill_secret }}" required autocomplete="off">
+    <label>Public HTTPS URL <span style="color:var(--sub);font-weight:400">(required by Spotify)</span></label>
+    <input name="public_url" type="url" placeholder="https://dashboard.example.com" value="{{ prefill_url }}" autocomplete="off" autocapitalize="none">
+    <p class="hint" style="margin-top:6px">Spotify only allows <b>https</b> redirect URLs (except 127.0.0.1). Enter the public HTTPS address that reaches this dashboard — e.g. your Cloudflare Tunnel hostname. Leave blank if you already open this page over https.</p>
     <div style="background:#0d1320;border:1px solid var(--border);border-radius:10px;padding:12px;margin-top:16px">
       <div style="font-size:12px;color:var(--sub);margin-bottom:7px">In your <a href="https://developer.spotify.com/dashboard" target="_blank" style="color:var(--blue);text-decoration:none">Spotify app</a> → <b>Settings → Edit</b>, add this <b>exact</b> Redirect URI and Save:</div>
       <div style="display:flex;gap:8px;align-items:stretch">
@@ -2873,24 +2885,61 @@ a{display:inline-block;margin-top:20px;color:#3b82f6;font-size:14px;}
 </html>"""
 
 
+def _oauth_base():
+    """Public origin to use for the Spotify redirect URI.
+
+    Spotify requires https for any non-loopback redirect URI, but the dashboard
+    serves plain http on the LAN. Preference order:
+      1. An explicit public HTTPS URL the user saved (e.g. a Cloudflare tunnel).
+      2. The request origin (correct https when reached via a proxy/tunnel,
+         thanks to ProxyFix).
+      3. The request host with the scheme forced to https (loopback keeps http,
+         which Spotify allows).
+    """
+    saved = (_cfg.load_setup().get("oauth_base_url") or "").strip()
+    if saved:
+        return saved.rstrip("/")
+    host = request.host  # includes :port
+    if request.scheme == "https" or host.startswith(("127.0.0.1", "localhost")):
+        return f"{request.scheme}://{host}"
+    return f"https://{host}"
+
+
+def _spotify_redirect_uri():
+    return _oauth_base() + "/spotify/callback"
+
+
 @app.route("/spotify/setup", methods=["GET", "POST"])
 @login_required
 def spotify_setup():
-    redirect_uri = request.url_root.rstrip("/") + "/spotify/callback"
+    redirect_uri = _spotify_redirect_uri()
 
     if request.method == "POST":
         client_id     = request.form.get("client_id", "").strip()
         client_secret = request.form.get("client_secret", "").strip()
+        public_url    = request.form.get("public_url", "").strip()
+        # Persist (or clear) the explicit public HTTPS base for OAuth.
+        if public_url:
+            if not public_url.lower().startswith("https://"):
+                return render_template_string(_SPOTIFY_SETUP_HTML,
+                    redirect_uri=redirect_uri, error="Public URL must start with https://",
+                    already=False, prefill_id=client_id, prefill_secret="",
+                    prefill_url=public_url, **_TMPL_VARS)
+            _cfg.save_setup({"oauth_base_url": public_url.rstrip("/")})
+        else:
+            _cfg.save_setup({"oauth_base_url": ""})
+        redirect_uri = _spotify_redirect_uri()   # recompute after saving the base
         if not client_id or not client_secret:
             return render_template_string(_SPOTIFY_SETUP_HTML,
-                redirect_uri=redirect_uri, error="Both fields are required.",
+                redirect_uri=redirect_uri, error="Client ID and Secret are required.",
                 already=False, prefill_id=client_id, prefill_secret="",
-                **_TMPL_VARS)
-        # Store creds in session for callback
+                prefill_url=public_url, **_TMPL_VARS)
+        # Store creds + the exact redirect URI in session for the callback to reuse.
         state = _secrets.token_urlsafe(16)
-        session["sp_state"]  = state
-        session["sp_cid"]    = client_id
-        session["sp_csec"]   = client_secret
+        session["sp_state"]    = state
+        session["sp_cid"]      = client_id
+        session["sp_csec"]     = client_secret
+        session["sp_redirect"] = redirect_uri
         auth_url = (
             "https://accounts.spotify.com/authorize"
             f"?client_id={_urlquote(client_id)}"
@@ -2912,11 +2961,12 @@ def spotify_setup():
             already        = bool(saved.get("refresh_token"))
         except Exception:
             pass
+    prefill_url = (_cfg.load_setup().get("oauth_base_url") or "")
 
     return render_template_string(_SPOTIFY_SETUP_HTML,
         redirect_uri=redirect_uri, error=None, already=already,
         prefill_id=prefill_id, prefill_secret=prefill_secret,
-        **_TMPL_VARS)
+        prefill_url=prefill_url, **_TMPL_VARS)
 
 
 @app.route("/spotify/callback")
@@ -2937,7 +2987,8 @@ def spotify_callback():
     client_id     = session.pop("sp_cid", "")
     client_secret = session.pop("sp_csec", "")
     session.pop("sp_state", None)
-    redirect_uri  = request.url_root.rstrip("/") + "/spotify/callback"
+    # Reuse the exact redirect URI from /authorize (must match byte-for-byte).
+    redirect_uri  = session.pop("sp_redirect", None) or _spotify_redirect_uri()
 
     # Exchange auth code for tokens
     auth_header = _b64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
